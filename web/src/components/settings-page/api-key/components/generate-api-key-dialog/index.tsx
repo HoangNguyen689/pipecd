@@ -9,12 +9,13 @@ import {
   MenuItem,
   Select,
   TextField,
-} from "@material-ui/core";
+} from "@mui/material";
 import { useFormik } from "formik";
 import { FC } from "react";
 import * as yup from "yup";
 import { API_KEY_ROLE_TEXT } from "~/constants/api-key-role-text";
-import { APIKey } from "~/modules/api-keys";
+import { APIKey } from "pipecd/web/model/apikey_pb";
+
 export interface GenerateAPIKeyDialogProps {
   open: boolean;
   onClose: () => void;

@@ -1,76 +1,59 @@
-import {
-  Box,
-  Button,
-  CircularProgress,
-  Divider,
-  Drawer,
-  makeStyles,
-  Toolbar,
-} from "@material-ui/core";
-import { Add } from "@material-ui/icons";
-import CloseIcon from "@material-ui/icons/Close";
-import FilterIcon from "@material-ui/icons/FilterList";
-import RefreshIcon from "@material-ui/icons/Refresh";
-import { FC, useCallback, useEffect, useState } from "react";
+import { Box, Button, Divider, Drawer, Toolbar } from "@mui/material";
+import { Add } from "@mui/icons-material";
+import CloseIcon from "@mui/icons-material/Close";
+import FilterIcon from "@mui/icons-material/FilterList";
+import RefreshIcon from "@mui/icons-material/Refresh";
+import LockOutlineIcon from "@mui/icons-material/LockOutline";
+import { FC, useCallback, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { PAGE_PATH_APPLICATIONS } from "~/constants/path";
 import {
   UI_TEXT_ADD,
+  UI_ENCRYPT_SECRET,
   UI_TEXT_FILTER,
   UI_TEXT_HIDE_FILTER,
   UI_TEXT_REFRESH,
 } from "~/constants/ui-text";
-import { useAppDispatch, useAppSelector } from "~/hooks/redux";
-import {
-  clearAddedApplicationId,
-  fetchApplications,
-} from "~/modules/applications";
 import {
   arrayFormat,
   stringifySearchParams,
   useSearchParams,
 } from "~/utils/search-params";
 import AddApplicationDrawer from "./add-application-drawer";
-import EditApplicationDrawer from "./edit-application-drawer";
 import { ApplicationAddedView } from "./application-added-view";
 import { ApplicationFilter } from "./application-filter";
 import { ApplicationList } from "./application-list";
-
-const useStyles = makeStyles((theme) => ({
-  main: {
-    display: "flex",
-    overflowY: "hidden",
-    overflowX: "auto",
-    flex: 1,
-  },
-  toolbarSpacer: {
-    flexGrow: 1,
-  },
-  buttonProgress: {
-    color: theme.palette.primary.main,
-    position: "absolute",
-    top: "50%",
-    left: "50%",
-    marginTop: -12,
-    marginLeft: -12,
-  },
-}));
+import EncryptSecretDrawer from "./encrypt-secret-drawer";
+import { SpinnerIcon } from "~/styles/button";
+import {
+  ApplicationsFilterOptions,
+  useGetApplications,
+} from "~/queries/applications/use-get-applications";
+import { getTypedValue, isString, isStringArray } from "~/utils/common";
 
 export const ApplicationIndexPage: FC = () => {
-  const classes = useStyles();
-  const dispatch = useAppDispatch();
   const navigate = useNavigate();
   const filterOptions = useSearchParams();
   const [openAddForm, setOpenAddForm] = useState(false);
   const [openFilter, setOpenFilter] = useState(true);
-  const isAdding = useAppSelector<boolean>(
-    (state) => state.applications.adding
-  );
-  const isLoading = useAppSelector<boolean>(
-    (state) => state.applications.loading
-  );
-  const addedApplicationId = useAppSelector<string | null>(
-    (state) => state.applications.addedApplicationId
+  const [openEncryptSecretDrawer, setOpenEncryptSecretDrawer] = useState(false);
+  const [showCongratulation, setShowCongratulation] = useState(false);
+
+  const searchValues: ApplicationsFilterOptions = useMemo(() => {
+    return {
+      ...filterOptions,
+      page: undefined,
+      activeStatus: getTypedValue(filterOptions, "activeStatus", isString),
+      kind: getTypedValue(filterOptions, "kind", isString),
+      syncStatus: getTypedValue(filterOptions, "syncStatus", isString),
+      name: getTypedValue(filterOptions, "name", isString),
+      pipedId: getTypedValue(filterOptions, "pipedId", isString),
+      labels: getTypedValue(filterOptions, "labels", isStringArray),
+    };
+  }, [filterOptions]);
+
+  const { data: applications, isLoading, refetch } = useGetApplications(
+    searchValues
   );
 
   const currentPage =
@@ -101,12 +84,8 @@ export const ApplicationIndexPage: FC = () => {
     updateURL({ page: currentPage });
   }, [updateURL, currentPage]);
 
-  const fetchApplicationsWithOptions = useCallback(() => {
-    dispatch(fetchApplications(filterOptions));
-  }, [dispatch, filterOptions]);
-
   const handleCloseApplicationAddedView = (): void => {
-    dispatch(clearAddedApplicationId());
+    setShowCongratulation(false);
   };
 
   const handlePageChange = useCallback(
@@ -115,10 +94,6 @@ export const ApplicationIndexPage: FC = () => {
     },
     [updateURL, filterOptions]
   );
-
-  useEffect(() => {
-    fetchApplicationsWithOptions();
-  }, [fetchApplicationsWithOptions]);
 
   return (
     <>
@@ -130,17 +105,28 @@ export const ApplicationIndexPage: FC = () => {
         >
           {UI_TEXT_ADD}
         </Button>
-        <div className={classes.toolbarSpacer} />
+        <Button
+          color="primary"
+          startIcon={<LockOutlineIcon />}
+          onClick={() => setOpenEncryptSecretDrawer(true)}
+          sx={{ ml: 1 }}
+        >
+          {UI_ENCRYPT_SECRET}
+        </Button>
+        <Box
+          sx={{
+            flex: 1,
+          }}
+        />
         <Button
           color="primary"
           startIcon={<RefreshIcon />}
-          onClick={fetchApplicationsWithOptions}
+          onClick={() => refetch()}
+          sx={{ position: "relative" }}
           disabled={isLoading}
         >
           {UI_TEXT_REFRESH}
-          {isLoading && (
-            <CircularProgress size={24} className={classes.buttonProgress} />
-          )}
+          {isLoading && <SpinnerIcon />}
         </Button>
         <Button
           color="primary"
@@ -150,46 +136,61 @@ export const ApplicationIndexPage: FC = () => {
           {openFilter ? UI_TEXT_HIDE_FILTER : UI_TEXT_FILTER}
         </Button>
       </Toolbar>
-
       <Divider />
-
-      <div className={classes.main}>
-        <Box display="flex" flexDirection="column" flex={1} p={2}>
+      <Box
+        sx={{
+          display: "flex",
+          overflowY: "hidden",
+          overflowX: "auto",
+          flex: 1,
+        }}
+      >
+        <Box
+          sx={{
+            display: "flex",
+            flexDirection: "column",
+            flex: 1,
+            p: 2,
+          }}
+        >
           <ApplicationList
+            applications={applications || []}
             currentPage={currentPage}
             onPageChange={handlePageChange}
-            onRefresh={fetchApplicationsWithOptions}
           />
         </Box>
         {openFilter && (
           <ApplicationFilter
+            applications={applications || []}
             options={filterOptions}
             onChange={handleFilterChange}
             onClear={handleFilterClear}
           />
         )}
-      </div>
-
+      </Box>
       <AddApplicationDrawer
         open={openAddForm}
         onClose={() => setOpenAddForm(false)}
         onAdded={() => {
           setOpenAddForm(false);
-          fetchApplicationsWithOptions();
+          setShowCongratulation(true);
         }}
       />
-      <EditApplicationDrawer onUpdated={fetchApplicationsWithOptions} />
 
       <Drawer
         anchor="right"
-        open={!!addedApplicationId}
+        open={!!showCongratulation}
         onClose={(_, reason) => {
-          if (reason === "backdropClick" && isAdding) return;
+          if (reason === "backdropClick") return;
           handleCloseApplicationAddedView();
         }}
       >
         <ApplicationAddedView onClose={handleCloseApplicationAddedView} />
       </Drawer>
+      <EncryptSecretDrawer
+        open={openEncryptSecretDrawer}
+        onClose={() => setOpenEncryptSecretDrawer(false)}
+      />
     </>
   );
 };

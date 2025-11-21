@@ -20,10 +20,11 @@ import (
 
 	"go.uber.org/zap"
 
+	sdk "github.com/pipe-cd/piped-plugin-sdk-go"
+
 	kubeconfig "github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/kubernetes_multicluster/config"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/kubernetes_multicluster/provider"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/kubernetes_multicluster/toolregistry"
-	"github.com/pipe-cd/pipecd/pkg/plugin/sdk"
 )
 
 // Plugin implements the sdk.DeploymentPlugin interface.
@@ -71,7 +72,7 @@ func (p *Plugin) ExecuteStage(ctx context.Context, _ *sdk.ConfigNone, dts []*sdk
 	}
 }
 
-func (p *Plugin) loadManifests(ctx context.Context, deploy *sdk.Deployment, spec *kubeconfig.KubernetesApplicationSpec, deploymentSource *sdk.DeploymentSource[kubeconfig.KubernetesApplicationSpec], loader loader, multiTarget *kubeconfig.KubernetesMultiTarget) ([]provider.Manifest, error) {
+func (p *Plugin) loadManifests(ctx context.Context, deploy *sdk.Deployment, spec *kubeconfig.KubernetesApplicationSpec, deploymentSource *sdk.DeploymentSource[kubeconfig.KubernetesApplicationSpec], loader loader, logger *zap.Logger, multiTarget *kubeconfig.KubernetesMultiTarget) ([]provider.Manifest, error) {
 	// override values if multiTarget has value.
 	manifestPathes := spec.Input.Manifests
 	if multiTarget != nil {
@@ -89,13 +90,35 @@ func (p *Plugin) loadManifests(ctx context.Context, deploy *sdk.Deployment, spec
 		ConfigFilename:   deploymentSource.ApplicationConfigFilename,
 		Manifests:        manifestPathes,
 		Namespace:        spec.Input.Namespace,
-		TemplatingMethod: provider.TemplatingMethodNone, // TODO: Implement detection of templating method or add it to the config spec.
-
-		// TODO: Define other fields for LoaderInput
+		KustomizeVersion: spec.Input.KustomizeVersion,
+		KustomizeOptions: spec.Input.KustomizeOptions,
+		HelmVersion:      spec.Input.HelmVersion,
+		HelmChart:        spec.Input.HelmChart,
+		HelmOptions:      spec.Input.HelmOptions,
+		Logger:           logger,
 	})
 
 	if err != nil {
 		return nil, err
+	}
+
+	// Add builtin labels and annotations for tracking application live state.
+	for i := range manifests {
+		manifests[i].AddLabels(map[string]string{
+			provider.LabelManagedBy:   provider.ManagedByPiped,
+			provider.LabelPiped:       deploy.PipedID,
+			provider.LabelApplication: deploy.ApplicationID,
+			provider.LabelCommitHash:  deploymentSource.CommitHash,
+		})
+
+		manifests[i].AddAnnotations(map[string]string{
+			provider.LabelManagedBy:          provider.ManagedByPiped,
+			provider.LabelPiped:              deploy.PipedID,
+			provider.LabelApplication:        deploy.ApplicationID,
+			provider.LabelOriginalAPIVersion: manifests[i].APIVersion(),
+			provider.LabelResourceKey:        manifests[i].Key().String(),
+			provider.LabelCommitHash:         deploymentSource.CommitHash,
+		})
 	}
 
 	return manifests, nil
@@ -112,7 +135,7 @@ func (p *Plugin) DetermineVersions(ctx context.Context, _ *sdk.ConfigNone, input
 	}
 
 	// TODO: consider multiTarget later
-	manifests, err := p.loadManifests(ctx, &input.Request.Deployment, cfg.Spec, &input.Request.DeploymentSource, provider.NewLoader(toolregistry.NewRegistry(input.Client.ToolRegistry())), &kubeconfig.KubernetesMultiTarget{})
+	manifests, err := p.loadManifests(ctx, &input.Request.Deployment, cfg.Spec, &input.Request.DeploymentSource, provider.NewLoader(toolregistry.NewRegistry(input.Client.ToolRegistry())), logger, &kubeconfig.KubernetesMultiTarget{})
 	if err != nil {
 		logger.Error("Failed while loading manifests", zap.Error(err))
 		return nil, err
@@ -135,7 +158,7 @@ func (p *Plugin) DetermineStrategy(ctx context.Context, _ *sdk.ConfigNone, input
 	}
 
 	// TODO: consider multiTarget later
-	runnings, err := p.loadManifests(ctx, &input.Request.Deployment, cfg.Spec, &input.Request.RunningDeploymentSource, loader, &kubeconfig.KubernetesMultiTarget{})
+	runnings, err := p.loadManifests(ctx, &input.Request.Deployment, cfg.Spec, &input.Request.RunningDeploymentSource, loader, logger, &kubeconfig.KubernetesMultiTarget{})
 
 	if err != nil {
 		logger.Error("Failed while loading running manifests", zap.Error(err))
@@ -143,7 +166,7 @@ func (p *Plugin) DetermineStrategy(ctx context.Context, _ *sdk.ConfigNone, input
 	}
 
 	// TODO: consider multiTarget later
-	targets, err := p.loadManifests(ctx, &input.Request.Deployment, cfg.Spec, &input.Request.TargetDeploymentSource, loader, &kubeconfig.KubernetesMultiTarget{})
+	targets, err := p.loadManifests(ctx, &input.Request.Deployment, cfg.Spec, &input.Request.TargetDeploymentSource, loader, logger, &kubeconfig.KubernetesMultiTarget{})
 
 	if err != nil {
 		logger.Error("Failed while loading target manifests", zap.Error(err))

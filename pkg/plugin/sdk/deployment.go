@@ -16,10 +16,10 @@ package sdk
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/pipe-cd/piped-plugin-sdk-go/signalhandler"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -27,7 +27,6 @@ import (
 
 	"github.com/pipe-cd/pipecd/pkg/model"
 	"github.com/pipe-cd/pipecd/pkg/plugin/api/v1alpha1/deployment"
-	"github.com/pipe-cd/pipecd/pkg/plugin/signalhandler"
 )
 
 // DeploymentPlugin is the interface that be implemented by a full-spec deployment plugin.
@@ -39,6 +38,8 @@ type DeploymentPlugin[Config, DeployTargetConfig, ApplicationConfigSpec any] int
 	// DetermineVersions determines the versions of the resources that will be deployed.
 	DetermineVersions(context.Context, *Config, *DetermineVersionsInput[ApplicationConfigSpec]) (*DetermineVersionsResponse, error)
 	// DetermineStrategy determines the strategy to deploy the resources.
+	// This is called when the strategy was not determined by common logic, including judging by the pipeline length, whether it is the first deployment, and so on.
+	// It should return (nil, nil) if the plugin does not have specific logic for DetermineStrategy.
 	DetermineStrategy(context.Context, *Config, *DetermineStrategyInput[ApplicationConfigSpec]) (*DetermineStrategyResponse, error)
 	// BuildQuickSyncStages builds the stages that will be executed during the quick sync process.
 	BuildQuickSyncStages(context.Context, *Config, *BuildQuickSyncStagesInput) (*BuildQuickSyncStagesResponse, error)
@@ -51,6 +52,17 @@ type StagePlugin[Config, DeployTargetConfig, ApplicationConfigSpec any] interfac
 	// FetchDefinedStages returns the list of stages that the plugin can execute.
 	FetchDefinedStages() []string
 	// BuildPipelineSyncStages builds the stages that will be executed by the plugin.
+	// The built pipeline includes non-rollback (defined in the application config) and rollback stages.
+	// The request contains only non-rollback stages whose names are listed in FetchDefinedStages() of this plugin.
+	//
+	// Note about the response indexes:
+	//  - For a non-rollback stage, use the index given by the request remaining the execution order.
+	//  - For a rollback stage, use one of the indexes given by the request.
+	//  - The indexes of the response stages must not be duplicated across non-rollback stages and rollback stages.
+	//    A non-rollback stage and a rollback stage can have the same index.
+	// For example, given request indexes are {2,4,5}, then
+	//  - Non-rollback stages indexes must be {2,4,5}
+	//  - Rollback stages indexes must be selected from {2,4,5}.  For a deploymentPlugin, using only {2} is recommended.
 	BuildPipelineSyncStages(context.Context, *Config, *BuildPipelineSyncStagesInput) (*BuildPipelineSyncStagesResponse, error)
 	// ExecuteStage executes the given stage.
 	ExecuteStage(context.Context, *Config, []*DeployTarget[DeployTargetConfig], *ExecuteStageInput[ApplicationConfigSpec]) (*ExecuteStageResponse, error)
@@ -59,11 +71,9 @@ type StagePlugin[Config, DeployTargetConfig, ApplicationConfigSpec any] interfac
 // DeploymentPluginServiceServer is the gRPC server that handles requests from the piped.
 type DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec any] struct {
 	deployment.UnimplementedDeploymentServiceServer
-	commonFields
+	commonFields[Config, DeployTargetConfig]
 
-	base          DeploymentPlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
-	config        Config
-	deployTargets map[string]*DeployTarget[DeployTargetConfig]
+	base DeploymentPlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
 }
 
 // Register registers the server to the given gRPC server.
@@ -71,38 +81,10 @@ func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationCo
 	deployment.RegisterDeploymentServiceServer(server, s)
 }
 
-// setFields sets the common fields and configs to the server.
-func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]) setFields(fields commonFields) error {
-	s.commonFields = fields
-
-	cfg := fields.config
-	if cfg.Config != nil {
-		if err := json.Unmarshal(cfg.Config, &s.config); err != nil {
-			s.logger.Fatal("failed to unmarshal the plugin config", zap.Error(err))
-			return err
-		}
-	}
-
-	s.deployTargets = make(map[string]*DeployTarget[DeployTargetConfig], len(cfg.DeployTargets))
-	for _, dt := range cfg.DeployTargets {
-		var sdkDt DeployTargetConfig
-		if err := json.Unmarshal(dt.Config, &sdkDt); err != nil {
-			s.logger.Fatal("failed to unmarshal deploy target config", zap.Error(err))
-			return err
-		}
-		s.deployTargets[dt.Name] = &DeployTarget[DeployTargetConfig]{
-			Name:   dt.Name,
-			Labels: dt.Labels,
-			Config: sdkDt,
-		}
-	}
-
-	return nil
-}
-
 func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]) FetchDefinedStages(context.Context, *deployment.FetchDefinedStagesRequest) (*deployment.FetchDefinedStagesResponse, error) {
 	return &deployment.FetchDefinedStagesResponse{Stages: s.base.FetchDefinedStages()}, nil
 }
+
 func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]) DetermineVersions(ctx context.Context, request *deployment.DetermineVersionsRequest) (*deployment.DetermineVersionsResponse, error) {
 	client := &Client{
 		base:          s.client,
@@ -112,7 +94,7 @@ func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationCo
 		toolRegistry:  s.toolRegistry,
 	}
 
-	req, err := newDetermineVersionsRequest[ApplicationConfigSpec](request)
+	req, err := newDetermineVersionsRequest[ApplicationConfigSpec](s.name, request)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to parse deployment source: %v", err)
 	}
@@ -122,7 +104,7 @@ func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationCo
 		Logger:  s.logger,
 	}
 
-	versions, err := s.base.DetermineVersions(ctx, &s.config, input)
+	versions, err := s.base.DetermineVersions(ctx, s.pluginConfig, input)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to determine versions: %v", err)
 	}
@@ -139,7 +121,7 @@ func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationCo
 		toolRegistry:  s.toolRegistry,
 	}
 
-	req, err := newDetermineStrategyRequest[ApplicationConfigSpec](request)
+	req, err := newDetermineStrategyRequest[ApplicationConfigSpec](s.name, request)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to parse deployment source: %v", err)
 	}
@@ -149,9 +131,17 @@ func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationCo
 		Logger:  s.logger,
 	}
 
-	response, err := s.base.DetermineStrategy(ctx, &s.config, input)
+	response, err := s.base.DetermineStrategy(ctx, s.pluginConfig, input)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to determine strategy: %v", err)
+	}
+	if response == nil {
+		// If the plugin does not have specific logic to determine strategy,
+		// use PipelineSync by default.
+		response = &DetermineStrategyResponse{
+			Strategy: SyncStrategyPipelineSync,
+			Summary:  "Use PipelineSync because no other logic was matched",
+		}
 	}
 	return newDetermineStrategyResponse(response)
 }
@@ -160,7 +150,7 @@ func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationCo
 		base:       s.client,
 		pluginName: s.name,
 	}
-	return buildPipelineSyncStages(ctx, s.name, s.base, &s.config, client, request, s.logger)
+	return buildPipelineSyncStages(ctx, s.base, s.pluginConfig, client, request, s.logger)
 }
 func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]) BuildQuickSyncStages(ctx context.Context, request *deployment.BuildQuickSyncStagesRequest) (*deployment.BuildQuickSyncStagesResponse, error) {
 	input := &BuildQuickSyncStagesInput{
@@ -174,35 +164,35 @@ func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationCo
 		Logger: s.logger,
 	}
 
-	response, err := s.base.BuildQuickSyncStages(ctx, &s.config, input)
+	response, err := s.base.BuildQuickSyncStages(ctx, s.pluginConfig, input)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to build quick sync stages: %v", err)
 	}
-	return newQuickSyncStagesResponse(s.name, time.Now(), response), nil
+	return newQuickSyncStagesResponse(time.Now(), response), nil
 }
 func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]) ExecuteStage(ctx context.Context, request *deployment.ExecuteStageRequest) (response *deployment.ExecuteStageResponse, _ error) {
-	lp := s.logPersister.StageLogPersister(request.GetInput().GetDeployment().GetId(), request.GetInput().GetStage().GetId())
+	slp := s.logPersister.StageLogPersister(request.GetInput().GetDeployment().GetId(), request.GetInput().GetStage().GetId())
 	defer func() {
 		// When termination signal received and the stage is not completed yet, we should not mark the log persister as completed.
 		// This can occur when the piped is shutting down while the stage is still running.
 		if !response.GetStatus().IsCompleted() && signalhandler.Terminated() {
 			return
 		}
-		lp.Complete(time.Minute)
+		slp.Complete(time.Minute)
 	}()
 
 	client := &Client{
-		base:          s.client,
-		pluginName:    s.name,
-		applicationID: request.GetInput().GetDeployment().GetApplicationId(),
-		deploymentID:  request.GetInput().GetDeployment().GetId(),
-		stageID:       request.GetInput().GetStage().GetId(),
-		logPersister:  lp,
-		toolRegistry:  s.toolRegistry,
+		base:              s.client,
+		pluginName:        s.name,
+		applicationID:     request.GetInput().GetDeployment().GetApplicationId(),
+		deploymentID:      request.GetInput().GetDeployment().GetId(),
+		stageID:           request.GetInput().GetStage().GetId(),
+		stageLogPersister: slp,
+		toolRegistry:      s.toolRegistry,
 	}
 
 	// Get the deploy targets set on the deployment from the piped plugin config.
-	dtNames := request.GetInput().GetDeployment().GetDeployTargets(s.commonFields.config.Name)
+	dtNames := request.GetInput().GetDeployment().GetDeployTargets(s.config.Name)
 	deployTargets := make([]*DeployTarget[DeployTargetConfig], 0, len(dtNames))
 	for _, name := range dtNames {
 		dt, ok := s.deployTargets[name]
@@ -213,36 +203,20 @@ func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationCo
 		deployTargets = append(deployTargets, dt)
 	}
 
-	return executeStage(ctx, s.base, &s.config, deployTargets, client, request, s.logger)
+	return executeStage(ctx, s.name, s.base, s.pluginConfig, deployTargets, client, request, s.logger)
 }
 
 // StagePluginServiceServer is the gRPC server that handles requests from the piped.
 type StagePluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec any] struct {
 	deployment.UnimplementedDeploymentServiceServer
-	commonFields
+	commonFields[Config, DeployTargetConfig]
 
-	base   StagePlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
-	config Config
+	base StagePlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
 }
 
 // Register registers the server to the given gRPC server.
 func (s *StagePluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]) Register(server *grpc.Server) {
 	deployment.RegisterDeploymentServiceServer(server, s)
-}
-
-// setFields sets the common fields and configs to the server.
-func (s *StagePluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]) setFields(fields commonFields) error {
-	s.commonFields = fields
-
-	cfg := fields.config
-	if cfg.Config != nil {
-		if err := json.Unmarshal(cfg.Config, &s.config); err != nil {
-			s.logger.Fatal("failed to unmarshal the plugin config", zap.Error(err))
-			return err
-		}
-	}
-
-	return nil
 }
 
 func (s *StagePluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]) FetchDefinedStages(context.Context, *deployment.FetchDefinedStagesRequest) (*deployment.FetchDefinedStagesResponse, error) {
@@ -260,46 +234,48 @@ func (s *StagePluginServiceServer[Config, DeployTargetConfig, ApplicationConfigS
 		pluginName: s.name,
 	}
 
-	return buildPipelineSyncStages(ctx, s.name, s.base, &s.config, client, request, s.logger)
+	return buildPipelineSyncStages(ctx, s.base, s.pluginConfig, client, request, s.logger)
 }
 func (s *StagePluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]) BuildQuickSyncStages(context.Context, *deployment.BuildQuickSyncStagesRequest) (*deployment.BuildQuickSyncStagesResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method BuildQuickSyncStages not implemented")
+	// Return an empty response in case the plugin does not support the QuickSync strategy.
+	return &deployment.BuildQuickSyncStagesResponse{}, nil
 }
 func (s *StagePluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]) ExecuteStage(ctx context.Context, request *deployment.ExecuteStageRequest) (response *deployment.ExecuteStageResponse, _ error) {
-	lp := s.logPersister.StageLogPersister(request.GetInput().GetDeployment().GetId(), request.GetInput().GetStage().GetId())
+	slp := s.logPersister.StageLogPersister(request.GetInput().GetDeployment().GetId(), request.GetInput().GetStage().GetId())
 	defer func() {
 		// When termination signal received and the stage is not completed yet, we should not mark the log persister as completed.
 		// This can occur when the piped is shutting down while the stage is still running.
 		if !response.GetStatus().IsCompleted() && signalhandler.Terminated() {
 			return
 		}
-		lp.Complete(time.Minute)
+		slp.Complete(time.Minute)
 	}()
 
 	client := &Client{
-		base:          s.client,
-		pluginName:    s.name,
-		applicationID: request.GetInput().GetDeployment().GetApplicationId(),
-		deploymentID:  request.GetInput().GetDeployment().GetId(),
-		stageID:       request.GetInput().GetStage().GetId(),
-		logPersister:  lp,
-		toolRegistry:  s.toolRegistry,
+		base:              s.client,
+		pluginName:        s.name,
+		applicationID:     request.GetInput().GetDeployment().GetApplicationId(),
+		deploymentID:      request.GetInput().GetDeployment().GetId(),
+		stageID:           request.GetInput().GetStage().GetId(),
+		stageLogPersister: slp,
+		toolRegistry:      s.toolRegistry,
 	}
 
-	return executeStage(ctx, s.base, &s.config, nil, client, request, s.logger) // TODO: pass the deployTargets
+	return executeStage(ctx, s.name, s.base, s.pluginConfig, nil, client, request, s.logger) // TODO: pass the deployTargets
 }
 
 // buildPipelineSyncStages builds the stages that will be executed by the plugin.
-func buildPipelineSyncStages[Config, DeployTargetConfig, ApplicationConfigSpec any](ctx context.Context, pluginName string, plugin StagePlugin[Config, DeployTargetConfig, ApplicationConfigSpec], config *Config, client *Client, request *deployment.BuildPipelineSyncStagesRequest, logger *zap.Logger) (*deployment.BuildPipelineSyncStagesResponse, error) {
+func buildPipelineSyncStages[Config, DeployTargetConfig, ApplicationConfigSpec any](ctx context.Context, plugin StagePlugin[Config, DeployTargetConfig, ApplicationConfigSpec], config *Config, client *Client, request *deployment.BuildPipelineSyncStagesRequest, logger *zap.Logger) (*deployment.BuildPipelineSyncStagesResponse, error) {
 	resp, err := plugin.BuildPipelineSyncStages(ctx, config, newPipelineSyncStagesInput(request, client, logger))
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to build pipeline sync stages: %v", err)
 	}
-	return newPipelineSyncStagesResponse(pluginName, time.Now(), request, resp)
+	return newPipelineSyncStagesResponse(time.Now(), request, resp)
 }
 
 func executeStage[Config, DeployTargetConfig, ApplicationConfigSpec any](
 	ctx context.Context,
+	pluginName string,
 	plugin StagePlugin[Config, DeployTargetConfig, ApplicationConfigSpec],
 	config *Config,
 	deployTargets []*DeployTarget[DeployTargetConfig],
@@ -307,7 +283,7 @@ func executeStage[Config, DeployTargetConfig, ApplicationConfigSpec any](
 	request *deployment.ExecuteStageRequest,
 	logger *zap.Logger,
 ) (*deployment.ExecuteStageResponse, error) {
-	targetDeploymentSource, err := newDeploymentSource[ApplicationConfigSpec](request.GetInput().GetTargetDeploymentSource())
+	targetDeploymentSource, err := newDeploymentSource[ApplicationConfigSpec](pluginName, request.GetInput().GetTargetDeploymentSource())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create target deployment source: %v", err)
 	}
@@ -315,7 +291,7 @@ func executeStage[Config, DeployTargetConfig, ApplicationConfigSpec any](
 	// running deploy source is empty on the first deployment
 	runningDeploymentSource := DeploymentSource[ApplicationConfigSpec]{}
 	if request.GetInput().GetRunningDeploymentSource() != nil {
-		runningDeploymentSource, err = newDeploymentSource[ApplicationConfigSpec](request.GetInput().GetRunningDeploymentSource())
+		runningDeploymentSource, err = newDeploymentSource[ApplicationConfigSpec](pluginName, request.GetInput().GetRunningDeploymentSource())
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to create running deployment source: %v", err)
 		}
@@ -324,6 +300,7 @@ func executeStage[Config, DeployTargetConfig, ApplicationConfigSpec any](
 	in := &ExecuteStageInput[ApplicationConfigSpec]{
 		Request: ExecuteStageRequest[ApplicationConfigSpec]{
 			StageName:               request.GetInput().GetStage().GetName(),
+			StageIndex:              int(request.GetInput().GetStage().GetIndex()),
 			StageConfig:             request.GetInput().GetStageConfig(),
 			RunningDeploymentSource: runningDeploymentSource,
 			TargetDeploymentSource:  targetDeploymentSource,
@@ -391,7 +368,7 @@ func newPipelineSyncStagesInput(request *deployment.BuildPipelineSyncStagesReque
 }
 
 // newPipelineSyncStagesResponse converts the response to the external representation.
-func newPipelineSyncStagesResponse(pluginName string, now time.Time, request *deployment.BuildPipelineSyncStagesRequest, response *BuildPipelineSyncStagesResponse) (*deployment.BuildPipelineSyncStagesResponse, error) {
+func newPipelineSyncStagesResponse(now time.Time, request *deployment.BuildPipelineSyncStagesRequest, response *BuildPipelineSyncStagesResponse) (*deployment.BuildPipelineSyncStagesResponse, error) {
 	// Convert the request stages to a map for easier access.
 	requestStages := make(map[int]*deployment.BuildPipelineSyncStagesRequest_StageConfig, len(request.GetStages()))
 	for _, s := range request.GetStages() {
@@ -405,12 +382,8 @@ func newPipelineSyncStagesResponse(pluginName string, now time.Time, request *de
 		if !ok {
 			return nil, status.Errorf(codes.Internal, "missing stage with index %d in the request, it's unexpected behavior of the plugin", s.Index)
 		}
-		id := requestStage.GetId()
-		if id == "" {
-			id = fmt.Sprintf("%s-stage-%d", pluginName, s.Index)
-		}
 
-		stages = append(stages, s.toModel(id, requestStage.GetDesc(), now))
+		stages = append(stages, s.toModel(requestStage.GetDesc(), now))
 	}
 	return &deployment.BuildPipelineSyncStagesResponse{
 		Stages: stages,
@@ -418,11 +391,10 @@ func newPipelineSyncStagesResponse(pluginName string, now time.Time, request *de
 }
 
 // newQuickSyncStagesResponse converts the response to the external representation.
-func newQuickSyncStagesResponse(pluginName string, now time.Time, response *BuildQuickSyncStagesResponse) *deployment.BuildQuickSyncStagesResponse {
+func newQuickSyncStagesResponse(now time.Time, response *BuildQuickSyncStagesResponse) *deployment.BuildQuickSyncStagesResponse {
 	stages := make([]*model.PipelineStage, 0, len(response.Stages))
-	for i, s := range response.Stages {
-		id := fmt.Sprintf("%s-stage-%d", pluginName, i)
-		stages = append(stages, s.toModel(id, now))
+	for _, s := range response.Stages {
+		stages = append(stages, s.toModel(now))
 	}
 	return &deployment.BuildQuickSyncStagesResponse{
 		Stages: stages,
@@ -503,21 +475,23 @@ type PipelineStage struct {
 	Metadata map[string]string
 	// AvailableOperation indicates the manual operation that the user can perform.
 	AvailableOperation ManualOperation
+	// AuthorizedOperators is the list of usernames who can execute the AvailableOperation.
+	AuthorizedOperators []string
 }
 
-func (p *PipelineStage) toModel(id, description string, now time.Time) *model.PipelineStage {
+func (p *PipelineStage) toModel(description string, now time.Time) *model.PipelineStage {
 	return &model.PipelineStage{
-		Id:                 id,
-		Name:               p.Name,
-		Desc:               description,
-		Index:              int32(p.Index),
-		Status:             model.StageStatus_STAGE_NOT_STARTED_YET,
-		StatusReason:       "", // TODO: set the reason
-		Metadata:           p.Metadata,
-		Rollback:           p.Rollback,
-		CreatedAt:          now.Unix(),
-		UpdatedAt:          now.Unix(),
-		AvailableOperation: p.AvailableOperation.toModelEnum(),
+		Name:                p.Name,
+		Desc:                description,
+		Index:               int32(p.Index),
+		Status:              model.StageStatus_STAGE_NOT_STARTED_YET,
+		StatusReason:        "", // TODO: set the reason
+		Metadata:            p.Metadata,
+		Rollback:            p.Rollback,
+		CreatedAt:           now.Unix(),
+		UpdatedAt:           now.Unix(),
+		AvailableOperation:  p.AvailableOperation.toModelEnum(),
+		AuthorizedOperators: p.AuthorizedOperators,
 	}
 }
 
@@ -536,9 +510,8 @@ type QuickSyncStage struct {
 	AvailableOperation ManualOperation
 }
 
-func (p *QuickSyncStage) toModel(id string, now time.Time) *model.PipelineStage {
+func (p *QuickSyncStage) toModel(now time.Time) *model.PipelineStage {
 	return &model.PipelineStage{
-		Id:                 id,
 		Name:               p.Name,
 		Desc:               p.Description,
 		Index:              0,
@@ -566,6 +539,8 @@ type ExecuteStageInput[ApplicationConfigSpec any] struct {
 type ExecuteStageRequest[ApplicationConfigSpec any] struct {
 	// The name of the stage to execute.
 	StageName string
+	// The index of the stage to execute.
+	StageIndex int
 	// Json encoded configuration of the stage.
 	StageConfig []byte
 
@@ -595,6 +570,12 @@ type Deployment struct {
 	TriggeredBy string
 	// CreatedAt is the time when the deployment was created.
 	CreatedAt int64
+	// RepositoryURL is the repo remote path
+	RepositoryURL string
+	// Summary is the simple description about what this deployment does
+	Summary string
+	// Labels are custom attributes to identify applications
+	Labels map[string]string
 }
 
 // newDeployment converts the model.Deployment to the internal representation.
@@ -607,6 +588,9 @@ func newDeployment(deployment *model.Deployment) Deployment {
 		ProjectID:       deployment.GetProjectId(),
 		TriggeredBy:     deployment.TriggeredBy(),
 		CreatedAt:       deployment.GetCreatedAt(),
+		RepositoryURL:   deployment.GetGitPath().GetRepo().GetRemote(),
+		Summary:         deployment.GetSummary(),
+		Labels:          deployment.GetLabels(),
 	}
 }
 
@@ -626,8 +610,8 @@ const (
 	StageStatusFailure
 	// StageStatusExited can be used when the stage succeeded and exit the pipeline without executing the following stages.
 	StageStatusExited
-
-	// StageStatusSkipped // TODO: If SDK can handle whole skipping, this is unnecessary.
+	// StageStatusSkipped indicates that the stage was skipped manually.
+	StageStatusSkipped
 )
 
 // toModelEnum converts the StageStatus to the model.StageStatus.
@@ -640,8 +624,23 @@ func (o StageStatus) toModelEnum() model.StageStatus {
 		return model.StageStatus_STAGE_FAILURE
 	case StageStatusExited:
 		return model.StageStatus_STAGE_EXITED
+	case StageStatusSkipped:
+		return model.StageStatus_STAGE_SKIPPED
 	default:
 		return model.StageStatus_STAGE_FAILURE
+	}
+}
+
+func (o StageStatus) String() string {
+	switch o {
+	case StageStatusSuccess:
+		return model.StageStatus_STAGE_SUCCESS.String()
+	case StageStatusFailure:
+		return model.StageStatus_STAGE_FAILURE.String()
+	case StageStatusExited:
+		return model.StageStatus_STAGE_EXITED.String()
+	default:
+		return model.StageStatus_STAGE_FAILURE.String()
 	}
 }
 
@@ -658,6 +657,17 @@ const (
 	CommandTypeApproveStage CommandType = iota
 	CommandTypeSkipStage
 )
+
+// toModelEnum converts the CommandType to the model.Command_Type.
+func (c CommandType) toModelEnum() (model.Command_Type, error) {
+	switch c {
+	case CommandTypeApproveStage:
+		return model.Command_APPROVE_STAGE, nil
+	case CommandTypeSkipStage:
+		return model.Command_SKIP_STAGE, nil
+	}
+	return 0, fmt.Errorf("unsupported CommandType: %v", c)
+}
 
 // newStageCommand converts the model.Command to the internal representation.
 func newStageCommand(c *model.Command) (StageCommand, error) {
@@ -696,8 +706,8 @@ type DetermineVersionsRequest[ApplicationConfigSpec any] struct {
 }
 
 // newDetermineVersionsRequest converts the common.DetermineVersionsRequest to the internal representation.
-func newDetermineVersionsRequest[ApplicationConfigSpec any](request *deployment.DetermineVersionsRequest) (DetermineVersionsRequest[ApplicationConfigSpec], error) {
-	ds, err := newDeploymentSource[ApplicationConfigSpec](request.GetInput().GetTargetDeploymentSource())
+func newDetermineVersionsRequest[ApplicationConfigSpec any](pluginName string, request *deployment.DetermineVersionsRequest) (DetermineVersionsRequest[ApplicationConfigSpec], error) {
+	ds, err := newDeploymentSource[ApplicationConfigSpec](pluginName, request.GetInput().GetTargetDeploymentSource())
 	if err != nil {
 		return DetermineVersionsRequest[ApplicationConfigSpec]{}, fmt.Errorf("failed to parse target deployment source: %w", err)
 	}
@@ -724,8 +734,6 @@ func (r *DetermineVersionsResponse) toModel() []*model.ArtifactVersion {
 
 // ArtifactVersion represents the version of an artifact.
 type ArtifactVersion struct {
-	// Kind is the kind of the artifact.
-	Kind ArtifactKind
 	// Version is the version of the artifact.
 	Version string
 	// Name is the name of the artifact.
@@ -737,42 +745,9 @@ type ArtifactVersion struct {
 // toModel converts the ArtifactVersion to the model.ArtifactVersion.
 func (v *ArtifactVersion) toModel() *model.ArtifactVersion {
 	return &model.ArtifactVersion{
-		Kind:    v.Kind.toModelEnum(),
 		Version: v.Version,
 		Name:    v.Name,
 		Url:     v.URL,
-	}
-}
-
-// ArtifactKind represents the kind of the artifact.
-type ArtifactKind int
-
-const (
-	// ArtifactKindUnknown indicates that the kind of the artifact is unknown.
-	ArtifactKindUnknown ArtifactKind = iota
-	// ArtifactKindContainerImage indicates that the artifact is a container image.
-	ArtifactKindContainerImage
-	// ArtifactKindS3Object indicates that the artifact is an S3 object.
-	ArtifactKindS3Object
-	// ArtifactKindGitSource indicates that the artifact is a git source.
-	ArtifactKindGitSource
-	// ArtifactKindTerraformModule indicates that the artifact is a terraform module.
-	ArtifactKindTerraformModule
-)
-
-// toModelEnum converts the ArtifactKind to the model.ArtifactVersion_Kind.
-func (k ArtifactKind) toModelEnum() model.ArtifactVersion_Kind {
-	switch k {
-	case ArtifactKindContainerImage:
-		return model.ArtifactVersion_CONTAINER_IMAGE
-	case ArtifactKindS3Object:
-		return model.ArtifactVersion_S3_OBJECT
-	case ArtifactKindGitSource:
-		return model.ArtifactVersion_GIT_SOURCE
-	case ArtifactKindTerraformModule:
-		return model.ArtifactVersion_TERRAFORM_MODULE
-	default:
-		return model.ArtifactVersion_UNKNOWN
 	}
 }
 
@@ -797,12 +772,12 @@ type DetermineStrategyRequest[ApplicationConfigSpec any] struct {
 }
 
 // newDetermineStrategyRequest converts the common.DetermineStrategyRequest to the internal representation.
-func newDetermineStrategyRequest[ApplicationConfigSpec any](request *deployment.DetermineStrategyRequest) (DetermineStrategyRequest[ApplicationConfigSpec], error) {
-	rds, err := newDeploymentSource[ApplicationConfigSpec](request.GetInput().GetRunningDeploymentSource())
+func newDetermineStrategyRequest[ApplicationConfigSpec any](pluginName string, request *deployment.DetermineStrategyRequest) (DetermineStrategyRequest[ApplicationConfigSpec], error) {
+	rds, err := newDeploymentSource[ApplicationConfigSpec](pluginName, request.GetInput().GetRunningDeploymentSource())
 	if err != nil {
 		return DetermineStrategyRequest[ApplicationConfigSpec]{}, fmt.Errorf("failed to parse running deployment source: %w", err)
 	}
-	tds, err := newDeploymentSource[ApplicationConfigSpec](request.GetInput().GetTargetDeploymentSource())
+	tds, err := newDeploymentSource[ApplicationConfigSpec](pluginName, request.GetInput().GetTargetDeploymentSource())
 	if err != nil {
 		return DetermineStrategyRequest[ApplicationConfigSpec]{}, fmt.Errorf("failed to parse target deployment source: %w", err)
 	}

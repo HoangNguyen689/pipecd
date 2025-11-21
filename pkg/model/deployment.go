@@ -16,12 +16,19 @@ package model
 
 import (
 	"fmt"
+	"strings"
 
 	"google.golang.org/protobuf/proto"
 )
 
 const (
 	MetadataKeyDeploymentNotification = "DeploymentNotification"
+	// MetadataKeyStageDisplay is the key of the metadata to be displayed on the deployment detail UI.
+	MetadataKeyStageDisplay = "pipecd/stage-display-metadata"
+	// MetadataKeyStageApprovedUsers is the key of the metadata of who approved the stage.
+	// It will be displayed in the DEPLOYMENT_APPROVED notification.
+	// e.g. user-1,user-2
+	MetadataKeyStageApprovedUsers = "pipecd/stage-approved-users"
 )
 
 var notCompletedDeploymentStatuses = []DeploymentStatus{
@@ -90,6 +97,33 @@ func CanUpdateStageStatus(cur, next StageStatus) bool {
 	return false
 }
 
+// DeploymentStatusesFromStrings converts a list of strings to list of DeploymentStatus.
+func DeploymentStatusesFromStrings(statuses []string) ([]DeploymentStatus, error) {
+	out := make([]DeploymentStatus, 0, len(statuses))
+	for _, s := range statuses {
+		status, ok := DeploymentStatus_value[s]
+		if !ok {
+			return nil, fmt.Errorf("invalid status %s", s)
+		}
+		out = append(out, DeploymentStatus(status))
+	}
+	return out, nil
+}
+
+// DeploymentStatusStrings returns a list of available deployment statuses in string.
+func DeploymentStatusStrings() []string {
+	out := make([]string, 0, len(DeploymentStatus_value))
+	for s := range DeploymentStatus_value {
+		out = append(out, s)
+	}
+	return out
+}
+
+// IsQuickSync returns whether this deployment is triggered by quick sync.
+func (d *Deployment) IsQuickSync() bool {
+	return d.GetTrigger().GetSyncStrategy() == SyncStrategy_QUICK_SYNC
+}
+
 // StageMap returns the map of id and the stage.
 func (d *Deployment) StageMap() map[string]*PipelineStage {
 	stage := make(map[string]*PipelineStage, len(d.Stages))
@@ -107,11 +141,6 @@ func (d *Deployment) Stage(id string) (*PipelineStage, bool) {
 		}
 	}
 	return nil, false
-}
-
-// IsSkippable checks whether skippable or not.
-func (p *PipelineStage) IsSkippable() bool {
-	return p.Name == StageAnalysis.String()
 }
 
 // CommitHash returns the hash value of trigger commit.
@@ -169,28 +198,6 @@ func (d *Deployment) FindRollbackStages() ([]*PipelineStage, bool) {
 	return rollbackStages, len(rollbackStages) > 0
 }
 
-// DeploymentStatusesFromStrings converts a list of strings to list of DeploymentStatus.
-func DeploymentStatusesFromStrings(statuses []string) ([]DeploymentStatus, error) {
-	out := make([]DeploymentStatus, 0, len(statuses))
-	for _, s := range statuses {
-		status, ok := DeploymentStatus_value[s]
-		if !ok {
-			return nil, fmt.Errorf("invalid status %s", s)
-		}
-		out = append(out, DeploymentStatus(status))
-	}
-	return out, nil
-}
-
-// DeploymentStatusStrings returns a list of available deployment statuses in string.
-func DeploymentStatusStrings() []string {
-	out := make([]string, 0, len(DeploymentStatus_value))
-	for s := range DeploymentStatus_value {
-		out = append(out, s)
-	}
-	return out
-}
-
 // ContainLabels checks if it has all the given labels.
 func (d *Deployment) ContainLabels(labels map[string]string) bool {
 	if len(d.Labels) < len(labels) {
@@ -215,10 +222,6 @@ func (d *Deployment) IsInChainDeployment() bool {
 	return d.DeploymentChainId != ""
 }
 
-func (d *Deployment) SetUpdatedAt(t int64) {
-	d.UpdatedAt = t
-}
-
 func (d *Deployment) GetDeployTargets(pluginName string) []string {
 	dps, ok := d.GetDeployTargetsByPlugin()[pluginName]
 	if !ok || len(dps.GetDeployTargets()) == 0 {
@@ -226,6 +229,19 @@ func (d *Deployment) GetDeployTargets(pluginName string) []string {
 	}
 
 	return dps.GetDeployTargets()
+}
+
+func (d *Deployment) GetLabelsString() string {
+	labels := make([]string, 0, len(d.Labels))
+	for k, v := range d.Labels {
+		labels = append(labels, fmt.Sprintf("%s=%s", k, v))
+	}
+	return strings.Join(labels, ",")
+}
+
+// IsSkippable checks whether skippable or not.
+func (p *PipelineStage) IsSkippable() bool {
+	return p.Name == StageAnalysis.String()
 }
 
 // Implement sort.Interface for PipelineStages.

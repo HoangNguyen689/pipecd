@@ -16,25 +16,67 @@ package sdk
 
 import (
 	"context"
+	"fmt"
 	"iter"
 	"slices"
 	"time"
 
+	"github.com/pipe-cd/piped-plugin-sdk-go/toolregistry"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/pipe-cd/pipecd/pkg/model"
-	"github.com/pipe-cd/pipecd/pkg/plugin/pipedapi"
 	"github.com/pipe-cd/pipecd/pkg/plugin/pipedservice"
-	"github.com/pipe-cd/pipecd/pkg/plugin/toolregistry"
+	"github.com/pipe-cd/pipecd/pkg/rpc/rpcclient"
 )
 
 const (
+	// MetadataKeyStageDisplay is the key of the stage metadata to be displayed on the deployment detail UI.
+	MetadataKeyStageDisplay = model.MetadataKeyStageDisplay
+	// MetadataKeyStageApprovedUsers is the key of the metadata of who approved the stage.
+	// It will be displayed in the DEPLOYMENT_APPROVED notification.
+	// e.g. user-1,user-2
+	MetadataKeyStageApprovedUsers = model.MetadataKeyStageApprovedUsers
+
 	listStageCommandsInterval = 5 * time.Second
 )
+
+type pluginServiceClient struct {
+	pipedservice.PluginServiceClient
+	conn *grpc.ClientConn
+}
+
+func newPluginServiceClient(ctx context.Context, address string, opts ...rpcclient.DialOption) (*pluginServiceClient, error) {
+	// Clone the opts to avoid modifying the original opts slice.
+	opts = slices.Clone(opts)
+
+	// Append the required options.
+	// The WithBlock option is required to make the client wait until the connection is up.
+	// The WithInsecure option is required to disable the transport security.
+	// The piped service does not require transport security because it is only used in localhost.
+	opts = append(opts, rpcclient.WithBlock(), rpcclient.WithInsecure())
+
+	conn, err := rpcclient.DialContext(ctx, address, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pluginServiceClient{
+		PluginServiceClient: pipedservice.NewPluginServiceClient(conn),
+		conn:                conn,
+	}, nil
+}
+
+func (c *pluginServiceClient) Close() error {
+	return c.conn.Close()
+}
 
 // Client is a toolkit for interacting with the piped service.
 // It provides methods to call the piped service APIs.
 // It's a wrapper around the raw piped service client.
 type Client struct {
-	base *pipedapi.PluginServiceClient
+	base *pluginServiceClient
 
 	// pluginName is used to identify which plugin sends requests to piped.
 	pluginName string
@@ -48,9 +90,9 @@ type Client struct {
 	// This field exists only when the client is working with a specific stage; for example, when this client is passed as the ExecuteStage method's argument.
 	stageID string
 
-	// logPersister is used to persist the stage logs.
+	// stageLogPersister is used to persist the stage logs.
 	// This field exists only when the client is working with a specific stage; for example, when this client is passed as the ExecuteStage method's argument.
-	logPersister StageLogPersister
+	stageLogPersister StageLogPersister
 
 	// toolRegistry is used to install and get the path of the tools used in the plugin.
 	// TODO: We should consider installing the tools in other way.
@@ -60,14 +102,14 @@ type Client struct {
 // NewClient creates a new client.
 // DO NOT USE this function except in tests.
 // FIXME: Remove this function and make a better way for tests.
-func NewClient(base *pipedapi.PluginServiceClient, pluginName, applicationID, stageID string, lp StageLogPersister, tr *toolregistry.ToolRegistry) *Client {
+func NewClient(base *pluginServiceClient, pluginName, applicationID, stageID string, slp StageLogPersister, tr *toolregistry.ToolRegistry) *Client {
 	return &Client{
-		base:          base,
-		pluginName:    pluginName,
-		applicationID: applicationID,
-		stageID:       stageID,
-		logPersister:  lp,
-		toolRegistry:  tr,
+		base:              base,
+		pluginName:        pluginName,
+		applicationID:     applicationID,
+		stageID:           stageID,
+		stageLogPersister: slp,
+		toolRegistry:      tr,
 	}
 }
 
@@ -84,16 +126,16 @@ type StageLogPersister interface {
 }
 
 // GetStageMetadata gets the metadata of the current stage.
-func (c *Client) GetStageMetadata(ctx context.Context, key string) (string, error) {
+func (c *Client) GetStageMetadata(ctx context.Context, key string) (string, bool, error) {
 	resp, err := c.base.GetStageMetadata(ctx, &pipedservice.GetStageMetadataRequest{
 		DeploymentId: c.deploymentID,
 		StageId:      c.stageID,
 		Key:          key,
 	})
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return resp.Value, nil
+	return resp.Value, resp.Found, nil
 }
 
 // PutStageMetadata stores the metadata of the current stage.
@@ -118,13 +160,16 @@ func (c *Client) PutStageMetadataMulti(ctx context.Context, metadata map[string]
 }
 
 // GetDeploymentPluginMetadata gets the metadata of the current deployment and plugin.
-func (c *Client) GetDeploymentPluginMetadata(ctx context.Context, key string) (string, error) {
+func (c *Client) GetDeploymentPluginMetadata(ctx context.Context, key string) (string, bool, error) {
 	resp, err := c.base.GetDeploymentPluginMetadata(ctx, &pipedservice.GetDeploymentPluginMetadataRequest{
 		DeploymentId: c.deploymentID,
 		PluginName:   c.pluginName,
 		Key:          key,
 	})
-	return resp.Value, err
+	if err != nil {
+		return "", false, err
+	}
+	return resp.Value, resp.Found, err
 }
 
 // PutDeploymentPluginMetadata stores the metadata of the current deployment and plugin.
@@ -150,21 +195,61 @@ func (c *Client) PutDeploymentPluginMetadataMulti(ctx context.Context, metadata 
 
 // GetDeploymentSharedMetadata gets the metadata of the current deployment
 // which is shared among piped and plugins.
-func (c *Client) GetDeploymentSharedMetadata(ctx context.Context, key string) (string, error) {
+func (c *Client) GetDeploymentSharedMetadata(ctx context.Context, key string) (string, bool, error) {
 	resp, err := c.base.GetDeploymentSharedMetadata(ctx, &pipedservice.GetDeploymentSharedMetadataRequest{
 		DeploymentId: c.deploymentID,
 		Key:          key,
 	})
-	return resp.Value, err
+	if err != nil {
+		return "", false, err
+	}
+	return resp.Value, resp.Found, err
+}
+
+// GetApplicationSharedObject gets the application object which is shared across deployments.
+func (c *Client) GetApplicationSharedObject(ctx context.Context, key string) (obj []byte, found bool, err error) {
+	resp, err := c.base.GetApplicationSharedObject(ctx, &pipedservice.GetApplicationSharedObjectRequest{
+		ApplicationId: c.applicationID,
+		PluginName:    c.pluginName,
+		Key:           key,
+	})
+	if status.Code(err) == codes.NotFound {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return resp.Object, true, nil
+}
+
+// PutApplicationSharedObject stores the application object which is shared across deployments.
+func (c *Client) PutApplicationSharedObject(ctx context.Context, key string, object []byte) error {
+	_, err := c.base.PutApplicationSharedObject(ctx, &pipedservice.PutApplicationSharedObjectRequest{
+		ApplicationId: c.applicationID,
+		PluginName:    c.pluginName,
+		Key:           key,
+		Object:        object,
+	})
+	return err
+}
+
+// StageLogPersister returns the stage log persister.
+// Use this to persist the stage logs and make it viewable on the UI.
+// This method should be called only when the client is working with a specific stage, for example, when this client is passed as the ExecuteStage method's argument.
+func (c *Client) StageLogPersister() (StageLogPersister, error) {
+	if c.stageLogPersister == nil {
+		return nil, fmt.Errorf("stage log persister is not set")
+	}
+	return c.stageLogPersister, nil
 }
 
 // LogPersister returns the stage log persister.
 // Use this to persist the stage logs and make it viewable on the UI.
 // This method should be called only when the client is working with a specific stage, for example, when this client is passed as the ExecuteStage method's argument.
 // Otherwise, it will return nil.
-// TODO: we should consider returning an error instead of nil, or return logger which prints to stdout.
+// Deprecated: use StageLogPersister instead.
 func (c *Client) LogPersister() StageLogPersister {
-	return c.logPersister
+	return c.stageLogPersister
 }
 
 // ToolRegistry returns the tool registry.
@@ -174,9 +259,21 @@ func (c *Client) ToolRegistry() *toolregistry.ToolRegistry {
 }
 
 // ListStageCommands returns the list of stage commands of the given command types.
-func (c Client) ListStageCommands(ctx context.Context, commandTypes ...model.Command_Type) iter.Seq2[*StageCommand, error] {
+func (c Client) ListStageCommands(ctx context.Context, commandTypes ...CommandType) iter.Seq2[*StageCommand, error] {
 	return func(yield func(*StageCommand, error) bool) {
 		returned := map[string]struct{}{}
+
+		modelCommandTypes := make([]model.Command_Type, 0, len(commandTypes))
+		for _, cmdType := range commandTypes {
+			modelType, err := cmdType.toModelEnum()
+			if err != nil {
+				if !yield(nil, err) {
+					return
+				}
+				continue
+			}
+			modelCommandTypes = append(modelCommandTypes, modelType)
+		}
 
 		for {
 			resp, err := c.base.ListStageCommands(ctx, &pipedservice.ListStageCommandsRequest{
@@ -191,7 +288,7 @@ func (c Client) ListStageCommands(ctx context.Context, commandTypes ...model.Com
 			}
 
 			for _, command := range resp.Commands {
-				if !slices.Contains(commandTypes, command.Type) {
+				if !slices.Contains(modelCommandTypes, command.Type) {
 					continue
 				}
 

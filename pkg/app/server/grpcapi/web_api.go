@@ -163,20 +163,19 @@ func NewWebAPI(
 	encrypter encrypter,
 	logger *zap.Logger,
 ) *WebAPI {
-	w := datastore.WebCommander
 	a := &WebAPI{
-		applicationStore:          datastore.NewApplicationStore(ds, w),
-		deploymentChainStore:      datastore.NewDeploymentChainStore(ds, w),
-		deploymentStore:           datastore.NewDeploymentStore(ds, w),
-		deploymentTraceStore:      datastore.NewDeploymentTraceStore(ds, w),
-		pipedStore:                datastore.NewPipedStore(ds, w),
-		projectStore:              datastore.NewProjectStore(ds, w),
-		apiKeyStore:               datastore.NewAPIKeyStore(ds, w),
+		applicationStore:          datastore.NewApplicationStore(ds),
+		deploymentChainStore:      datastore.NewDeploymentChainStore(ds),
+		deploymentStore:           datastore.NewDeploymentStore(ds),
+		deploymentTraceStore:      datastore.NewDeploymentTraceStore(ds),
+		pipedStore:                datastore.NewPipedStore(ds),
+		projectStore:              datastore.NewProjectStore(ds),
+		apiKeyStore:               datastore.NewAPIKeyStore(ds),
 		apiKeyLastUsedStore:       akluc,
-		eventStore:                datastore.NewEventStore(ds, w),
+		eventStore:                datastore.NewEventStore(ds),
 		stageLogStore:             sls,
 		applicationLiveStateStore: alss,
-		commandStore:              commandstore.NewStore(w, ds, sc, logger),
+		commandStore:              commandstore.NewStore(ds, sc, logger),
 		insightProvider:           ip,
 		unregisteredAppStore:      uas,
 		projectsInConfig:          projs,
@@ -1250,7 +1249,10 @@ func validateApprover(stages []*model.PipelineStage, commander, stageID string) 
 		if s.Id != stageID {
 			continue
 		}
-		if as := s.Metadata["Approvers"]; as != "" {
+		if aos := s.AuthorizedOperators; len(aos) > 0 {
+			approvers = aos
+		} else if as := s.Metadata["Approvers"]; as != "" {
+			// TODO: Remove this if-clause after most deployments with 'Approvers' metadata are finished.
 			approvers = strings.Split(as, ",")
 		}
 		break
@@ -1951,6 +1953,12 @@ func (a *WebAPI) ListReleasedVersions(ctx context.Context, req *webservice.ListR
 		if *release.Prerelease || *release.Draft {
 			continue
 		}
+		// Ignore module's release.
+		// Eg. pkg/app/pipedv1/plugin/kubernetes/v0.1.0
+		if !semver.IsValid(*release.TagName) {
+			continue
+		}
+
 		versions = append(versions, *release.TagName)
 	}
 
@@ -1986,21 +1994,21 @@ func (a *WebAPI) ListDeprecatedNotes(ctx context.Context, req *webservice.ListDe
 		return nil, gRPCStoreError(err, "list pipeds")
 	}
 
-	// No Pipeds for given project.
-	if len(pipeds) == 0 {
-		return &webservice.ListDeprecatedNotesResponse{}, nil
-	}
-
-	versions := make([]string, 0, len(pipeds))
+	var oldestVersion string
 	for _, piped := range pipeds {
 		if !semver.IsValid(piped.Version) {
 			continue
 		}
-		versions = append(versions, piped.Version)
+
+		if oldestVersion == "" || semver.Compare(piped.Version, oldestVersion) < 0 {
+			oldestVersion = piped.Version
+		}
 	}
 
-	semver.Sort(versions)
-	oldestVersion := versions[0]
+	// No Piped with valid version for given project.
+	if oldestVersion == "" {
+		return &webservice.ListDeprecatedNotesResponse{}, nil
+	}
 
 	// Github fecth release notes.
 	releases, _, err := a.githubCli.Repositories.ListReleases(ctx, "pipe-cd", "pipecd", nil)

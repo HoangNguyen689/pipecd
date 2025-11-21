@@ -28,8 +28,10 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
+	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/apistore/commandstore"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/controller/controllermetrics"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/deploysource"
+	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/metadatastore"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin"
 	"github.com/pipe-cd/pipecd/pkg/app/server/service/pipedservice"
 	config "github.com/pipe-cd/pipecd/pkg/configv1"
@@ -49,6 +51,8 @@ type scheduler struct {
 	gitClient       gitClient
 	notifier        notifier
 	secretDecrypter secretDecrypter
+	commandReporter commandstore.Reporter
+	metadataStore   metadatastore.MetadataStore
 
 	targetDSP  deploysource.Provider
 	runningDSP deploysource.Provider
@@ -81,6 +85,8 @@ func newScheduler(
 	pluginRegistry plugin.PluginRegistry,
 	notifier notifier,
 	secretsDecrypter secretDecrypter,
+	commandReporter commandstore.Reporter,
+	metadataStore metadatastore.MetadataStore,
 	logger *zap.Logger,
 	tracerProvider trace.TracerProvider,
 ) *scheduler {
@@ -88,7 +94,7 @@ func newScheduler(
 		zap.String("deployment-id", d.Id),
 		zap.String("app-id", d.ApplicationId),
 		zap.String("project-id", d.ProjectId),
-		zap.String("app-kind", d.Kind.String()),
+		zap.String("labels", d.GetLabelsString()),
 		zap.String("working-dir", workingDir),
 	)
 
@@ -100,6 +106,8 @@ func newScheduler(
 		pluginRegistry:       pluginRegistry,
 		notifier:             notifier,
 		secretDecrypter:      secretsDecrypter,
+		commandReporter:      commandReporter,
+		metadataStore:        metadataStore,
 		doneDeploymentStatus: d.Status,
 		cancelledCh:          make(chan *model.ReportableCommand, 1),
 		logger:               logger,
@@ -261,8 +269,8 @@ func (s *scheduler) Run(ctx context.Context) error {
 		"Deploy",
 		trace.WithAttributes(
 			attribute.String("application-id", s.deployment.ApplicationId),
-			attribute.String("kind", s.deployment.Kind.String()),
 			attribute.String("deployment-id", s.deployment.Id),
+			attribute.String("labels", s.deployment.GetLabelsString()),
 		))
 	defer span.End()
 
@@ -302,18 +310,33 @@ func (s *scheduler) Run(ctx context.Context) error {
 			statusReason = fmt.Sprintf("Failed while executing stage %s", ps.Id)
 			break
 		}
+		if ps.Status == model.StageStatus_STAGE_SKIPPED {
+			statusReason = fmt.Sprintf("Stage %s has been already skipped", ps.Id)
+			continue
+		}
+		if ps.Status == model.StageStatus_STAGE_EXITED {
+			deploymentStatus = model.DeploymentStatus_DEPLOYMENT_SUCCESS
+			statusReason = fmt.Sprintf("Deployment was exited before stage %s", ps.Id)
+			break
+		}
 
 		var (
 			result       model.StageStatus
 			sig, handler = NewStopSignal()
 			doneCh       = make(chan struct{})
+			timeout      <-chan time.Time // nil means no timeout.
 		)
+
+		// Set timeout for stage execution. Default to 6h.
+		if stageCfg, ok := s.genericApplicationConfig.GetStage(ps.Index); ok {
+			timeout = time.After(stageCfg.Timeout.Duration())
+		}
 
 		go func() {
 			_, span := s.tracer.Start(ctx, ps.Name, trace.WithAttributes(
 				attribute.String("application-id", s.deployment.ApplicationId),
-				attribute.String("kind", s.deployment.Kind.String()),
 				attribute.String("deployment-id", s.deployment.Id),
+				attribute.String("labels", s.deployment.GetLabelsString()),
 				attribute.String("stage-id", ps.Id),
 			))
 			defer span.End()
@@ -330,6 +353,9 @@ func (s *scheduler) Run(ctx context.Context) error {
 			case model.StageStatus_STAGE_FAILURE, model.StageStatus_STAGE_CANCELLED:
 				span.SetStatus(codes.Error, statusReason)
 			}
+
+			// Mark commands as handled regardless of the stage status because the commands will no longer be used.
+			s.commandReporter.ReportStageCommandsHandled(ctx, s.deployment.Id, ps.Id)
 
 			close(doneCh)
 		}()
@@ -350,6 +376,10 @@ func (s *scheduler) Run(ctx context.Context) error {
 				handler.Cancel()
 				<-doneCh
 			}
+
+		case <-timeout:
+			handler.Timeout()
+			<-doneCh
 
 		case <-doneCh:
 			break
@@ -419,8 +449,8 @@ func (s *scheduler) Run(ctx context.Context) error {
 
 					_, span := s.tracer.Start(ctx, rbs.Name, trace.WithAttributes(
 						attribute.String("application-id", s.deployment.ApplicationId),
-						attribute.String("kind", s.deployment.Kind.String()),
 						attribute.String("deployment-id", s.deployment.Id),
+						attribute.String("labels", s.deployment.GetLabelsString()),
 						attribute.String("stage-id", rbs.Id),
 					))
 					defer span.End()
@@ -480,6 +510,13 @@ func (s *scheduler) executeStage(sig StopSignal, ps *model.PipelineStage) (final
 		originalStatus = ps.Status
 	)
 
+	defer func() {
+		// Ensure reporting the status even if the stage is cancelled.
+		if err := s.reportStageStatus(context.Background(), ps.Id, finalStatus, ps.Requires); err != nil {
+			s.logger.Error("failed to report stage status", zap.Error(err))
+		}
+	}()
+
 	tds, err := s.targetDSP.Get(ctx, io.Discard)
 	if err != nil {
 		s.logger.Error("failed to get target deployment source", zap.String("stage-name", ps.Name), zap.Error(err))
@@ -523,6 +560,9 @@ func (s *scheduler) executeStage(sig StopSignal, ps *model.PipelineStage) (final
 	// Update stage status to RUNNING if needed.
 	if model.CanUpdateStageStatus(ps.Status, model.StageStatus_STAGE_RUNNING) {
 		if err := s.reportStageStatus(ctx, ps.Id, model.StageStatus_STAGE_RUNNING, ps.Requires); err != nil {
+			if sig.Signal() == StopSignalCancel {
+				return model.StageStatus_STAGE_CANCELLED
+			}
 			return model.StageStatus_STAGE_FAILURE
 		}
 		originalStatus = model.StageStatus_STAGE_RUNNING
@@ -532,18 +572,18 @@ func (s *scheduler) executeStage(sig StopSignal, ps *model.PipelineStage) (final
 	plugin, err := s.pluginRegistry.GetPluginClientByStageName(ps.Name)
 	if err != nil {
 		s.logger.Error("failed to find the plugin for the stage", zap.String("stage-name", ps.Name), zap.Error(err))
-		s.reportStageStatus(ctx, ps.Id, model.StageStatus_STAGE_FAILURE, ps.Requires)
 		return model.StageStatus_STAGE_FAILURE
 	}
 
 	// Load the stage configuration.
-	stageConfig, stageConfigFound := s.genericApplicationConfig.GetStageConfigByte(ps.Index)
-	if !stageConfigFound {
-		s.logger.Error("Unable to find the stage configuration", zap.String("stage-name", ps.Name))
-		if err := s.reportStageStatus(ctx, ps.Id, model.StageStatus_STAGE_FAILURE, ps.Requires); err != nil {
-			s.logger.Error("failed to report stage status", zap.Error(err))
+	var stageConfig []byte
+	if !s.deployment.IsQuickSync() {
+		var stageConfigFound bool
+		stageConfig, stageConfigFound = s.genericApplicationConfig.GetStageConfigByte(ps.Index)
+		if !stageConfigFound {
+			s.logger.Error("Unable to find the stage configuration", zap.String("stage-name", ps.Name))
+			return model.StageStatus_STAGE_FAILURE
 		}
-		return model.StageStatus_STAGE_FAILURE
 	}
 
 	// ensure pass nil as running deployment source in case of the first deployment
@@ -563,12 +603,24 @@ func (s *scheduler) executeStage(sig StopSignal, ps *model.PipelineStage) (final
 			TargetDeploymentSource:  tds.ToPluginDeploySource(),
 		},
 	})
-	// do not return error if the context is already canceled.
-	// this occurs when the stage is canceled.
-	// otherwise, return the error.
-	if err != nil && ctx.Err() == nil {
+
+	// Handle context error.
+	if ctx.Err() != nil {
+		if ctx.Err() == context.Canceled {
+			s.logger.Info("stage execution cancelled", zap.String("stage-name", ps.Name))
+			return model.StageStatus_STAGE_CANCELLED
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			s.logger.Info("stage execution timed out", zap.String("stage-name", ps.Name))
+			return model.StageStatus_STAGE_FAILURE
+		}
+		s.logger.Error("stage execution context failed", zap.String("stage-name", ps.Name), zap.Error(ctx.Err()))
+		return model.StageStatus_STAGE_FAILURE
+	}
+
+	// Handle plugin execution failure.
+	if err != nil {
 		s.logger.Error("failed to execute stage", zap.String("stage-name", ps.Name), zap.Error(err))
-		s.reportStageStatus(ctx, ps.Id, model.StageStatus_STAGE_FAILURE, ps.Requires)
 		return model.StageStatus_STAGE_FAILURE
 	}
 
@@ -587,7 +639,6 @@ func (s *scheduler) executeStage(sig StopSignal, ps *model.PipelineStage) (final
 		status == model.StageStatus_STAGE_EXITED ||
 		(status == model.StageStatus_STAGE_FAILURE && !sig.Terminated()) {
 
-		s.reportStageStatus(ctx, ps.Id, status, ps.Requires)
 		return status
 	}
 
@@ -649,7 +700,6 @@ func (s *scheduler) reportStageStatus(ctx context.Context, stageID string, statu
 			StageId:      stageID,
 			Status:       status,
 			Requires:     requires,
-			Visible:      true,
 			CompletedAt:  now.Unix(),
 		}
 		retry = pipedservice.NewRetry(10)
@@ -771,7 +821,7 @@ func (s *scheduler) reportDeploymentCompleted(ctx context.Context, status model.
 
 // getApplicationNotificationMentions returns the list of users groups who should be mentioned in the notification.
 func (s *scheduler) getApplicationNotificationMentions(event model.NotificationEventType) ([]string, []string, error) {
-	n, ok := s.deployment.Metadata[model.MetadataKeyDeploymentNotification]
+	n, ok := s.metadataStore.SharedGet(model.MetadataKeyDeploymentNotification)
 	if !ok {
 		return []string{}, []string{}, nil
 	}
@@ -793,7 +843,6 @@ func (s *scheduler) reportMostRecentlySuccessfulDeployment(ctx context.Context) 
 				DeploymentId:   s.deployment.Id,
 				Trigger:        s.deployment.Trigger,
 				Summary:        s.deployment.Summary,
-				Version:        s.deployment.Version,
 				Versions:       s.deployment.Versions,
 				ConfigFilename: s.deployment.GitPath.GetApplicationConfigFilename(),
 				StartedAt:      s.deployment.CreatedAt,
@@ -823,12 +872,46 @@ func (s *scheduler) notifyStageStartEvent(stage *model.PipelineStage) {
 			Stage:      stage,
 		},
 	})
+
+	if stage.AvailableOperation == model.ManualOperation_MANUAL_OPERATION_APPROVE {
+		users, groups, err := s.getApplicationNotificationMentions(model.NotificationEventType_EVENT_DEPLOYMENT_WAIT_APPROVAL)
+		if err != nil {
+			s.logger.Error("failed to get the list of mentions", zap.Error(err))
+		}
+		s.notifier.Notify(model.NotificationEvent{
+			Type: model.NotificationEventType_EVENT_DEPLOYMENT_WAIT_APPROVAL,
+			Metadata: &model.NotificationEventDeploymentWaitApproval{
+				Deployment:        s.deployment,
+				MentionedAccounts: users,
+				MentionedGroups:   groups,
+			},
+		})
+	}
 }
 
 // notifyStageEndEvent sends notification event based on the stage result.
 func (s *scheduler) notifyStageEndEvent(stage *model.PipelineStage, result model.StageStatus) {
 	switch result {
 	case model.StageStatus_STAGE_SUCCESS, model.StageStatus_STAGE_EXITED: // Exit stage is treated as success.
+
+		if stage.AvailableOperation == model.ManualOperation_MANUAL_OPERATION_APPROVE {
+			users, groups, err := s.getApplicationNotificationMentions(model.NotificationEventType_EVENT_DEPLOYMENT_APPROVED)
+			if err != nil {
+				s.logger.Error("failed to get the list of users", zap.Error(err))
+			}
+			if approvers, found := s.metadataStore.StageGet(stage.Id, model.MetadataKeyStageApprovedUsers); found {
+				s.notifier.Notify(model.NotificationEvent{
+					Type: model.NotificationEventType_EVENT_DEPLOYMENT_APPROVED,
+					Metadata: &model.NotificationEventDeploymentApproved{
+						Deployment:        s.deployment,
+						Approver:          approvers,
+						MentionedAccounts: users,
+						MentionedGroups:   groups,
+					},
+				})
+			}
+		}
+
 		s.notifier.Notify(model.NotificationEvent{
 			Type: model.NotificationEventType_EVENT_STAGE_SUCCEEDED,
 			Metadata: &model.NotificationEventStageSucceeded{

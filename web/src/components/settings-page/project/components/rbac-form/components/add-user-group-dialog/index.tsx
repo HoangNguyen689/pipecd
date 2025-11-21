@@ -9,24 +9,17 @@ import {
   MenuItem,
   Select,
   TextField,
-  makeStyles,
-} from "@material-ui/core";
+} from "@mui/material";
 import { useFormik } from "formik";
 import { FC } from "react";
 import * as yup from "yup";
-import { useAppSelector } from "~/hooks/redux";
+import { useGetProject } from "~/queries/project/use-get-project";
 
 export interface AddUserGroupDialogProps {
   open: boolean;
   onClose: () => void;
   onSubmit: (values: { ssoGroup: string; role: string }) => void;
 }
-
-const useStyles = makeStyles(() => ({
-  formItem: {
-    width: "50%",
-  },
-}));
 
 const validationSchema = yup.object({
   ssoGroup: yup.string().min(1).required(),
@@ -38,7 +31,6 @@ export const AddUserGroupDialog: FC<AddUserGroupDialogProps> = ({
   onSubmit,
   open,
 }) => {
-  const classes = useStyles();
   const formik = useFormik({
     initialValues: {
       ssoGroup: "",
@@ -57,7 +49,8 @@ export const AddUserGroupDialog: FC<AddUserGroupDialogProps> = ({
       onClose();
     },
   });
-  const roles = useAppSelector((state) => state.project.rbacRoles);
+  const { data: project } = useGetProject();
+  const roles = project?.rbacRoles || [];
 
   return (
     <Dialog open={open} onClose={onClose}>
@@ -76,11 +69,7 @@ export const AddUserGroupDialog: FC<AddUserGroupDialogProps> = ({
             required
             fullWidth
           />
-          <FormControl
-            className={classes.formItem}
-            variant="outlined"
-            margin="dense"
-          >
+          <FormControl sx={{ width: "50%" }} variant="outlined" margin="dense">
             <InputLabel id="role">Role</InputLabel>
             <Select
               id="role"

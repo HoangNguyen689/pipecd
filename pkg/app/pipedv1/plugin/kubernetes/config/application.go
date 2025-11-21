@@ -14,6 +14,12 @@
 
 package config
 
+import (
+	"encoding/json"
+
+	"github.com/creasty/defaults"
+)
+
 // K8sResourceReference represents a reference to a Kubernetes resource.
 // It is used to specify the resources which are treated as the workload of an application.
 type K8sResourceReference struct {
@@ -28,6 +34,10 @@ type KubernetesApplicationSpec struct {
 
 	// Configuration for quick sync.
 	QuickSync K8sSyncStageOptions `json:"quickSync"`
+
+	// Which resource should be considered as the Service of application.
+	// Empty means the first Service resource will be used.
+	Service K8sResourceReference `json:"service"`
 
 	// Which resources should be considered as the Workload of application.
 	// Empty means all Deployments.
@@ -45,6 +55,22 @@ type KubernetesApplicationSpec struct {
 	TrafficRouting *KubernetesTrafficRouting `json:"trafficRouting"`
 }
 
+func (s *KubernetesApplicationSpec) UnmarshalJSON(data []byte) error {
+	type alias KubernetesApplicationSpec
+
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+
+	*s = KubernetesApplicationSpec(a)
+	if err := defaults.Set(s); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (s *KubernetesApplicationSpec) Validate() error {
 	// TODO: Validate KubernetesApplicationSpec fields.
 	return nil
@@ -58,14 +84,24 @@ type KubernetesDeploymentInput struct {
 	// Version of kubectl will be used.
 	KubectlVersion string `json:"kubectlVersion,omitempty"`
 
+	// Version of kustomize will be used.
+	KustomizeVersion string `json:"kustomizeVersion,omitempty"`
+	// List of options that should be used by Kustomize commands.
+	KustomizeOptions map[string]string `json:"kustomizeOptions,omitempty"`
+
+	// Version of helm will be used.
+	HelmVersion string `json:"helmVersion,omitempty"`
+	// Where to fetch helm chart.
+	HelmChart *InputHelmChart `json:"helmChart,omitempty"`
+	// Configurable parameters for helm commands.
+	HelmOptions *InputHelmOptions `json:"helmOptions,omitempty"`
+
 	// The namespace where manifests will be applied.
 	Namespace string `json:"namespace,omitempty"`
 
 	// Automatically create a new namespace if it does not exist.
 	// Default is false.
 	AutoCreateNamespace bool `json:"autoCreateNamespace,omitempty"`
-
-	// TODO: Define fields for KubernetesDeploymentInput.
 }
 
 type KubernetesVariantLabel struct {
@@ -81,17 +117,6 @@ type KubernetesVariantLabel struct {
 	// The label value for BASELINE variant.
 	// Default is baseline.
 	BaselineValue string `json:"baselineValue" default:"baseline"`
-}
-
-type KubernetesDeployTargetConfig struct {
-	// The master URL of the kubernetes cluster.
-	// Empty means in-cluster.
-	MasterURL string `json:"masterURL,omitempty"`
-	// The path to the kubeconfig file.
-	// Empty means in-cluster.
-	KubeConfigPath string `json:"kubeConfigPath,omitempty"`
-	// Version of kubectl will be used.
-	KubectlVersion string `json:"kubectlVersion"`
 }
 
 // K8sResourcePatch represents a patch operation for a Kubernetes resource.

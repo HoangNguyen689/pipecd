@@ -94,8 +94,21 @@ func (a *Application) GetDeployTargets() []string {
 	return deployTargets
 }
 
-func (a *Application) SetUpdatedAt(t int64) {
-	a.UpdatedAt = t
+func (a *Application) GetDeployTargetsByPluginName(name string) []string {
+	dts, ok := a.DeployTargetsByPlugin[name]
+	if !ok {
+		return []string{}
+	}
+
+	return dts.GetDeployTargets()
+}
+
+func (a *Application) GetLabelsString() string {
+	labels := make([]string, 0, len(a.Labels))
+	for k, v := range a.Labels {
+		labels = append(labels, fmt.Sprintf("%s=%s", k, v))
+	}
+	return strings.Join(labels, ",")
 }
 
 func (ak ApplicationKind) CompatiblePlatformProviderType() PlatformProviderType {

@@ -37,32 +37,24 @@ type mockLivestatePlugin struct {
 	err    error
 }
 
-func (m *mockLivestatePlugin) Name() string {
-	return "mockLivestatePlugin"
-}
-
-func (m *mockLivestatePlugin) Version() string {
-	return "v1.0.0"
-}
-
-func (m *mockLivestatePlugin) GetLivestate(ctx context.Context, config *struct{}, targets []*DeployTarget[struct{}], input *GetLivestateInput[struct{}]) (*GetLivestateResponse, error) {
+func (m *mockLivestatePlugin) GetLivestate(ctx context.Context, config ConfigNone, targets DeployTargetsNone, input *GetLivestateInput[struct{}]) (*GetLivestateResponse, error) {
 	return m.result, m.err
 }
 
 func newTestLivestatePluginServer(t *testing.T, plugin *mockLivestatePlugin) *LivestatePluginServer[struct{}, struct{}, struct{}] {
 	return &LivestatePluginServer[struct{}, struct{}, struct{}]{
 		base: plugin,
-		commonFields: commonFields{
+		commonFields: commonFields[struct{}, struct{}]{
 			logger: zaptest.NewLogger(t),
 			config: &config.PipedPlugin{
 				Name: "mockLivestatePlugin",
 			},
-		},
-		deployTargets: map[string]*DeployTarget[struct{}]{
-			"target1": {
-				Name: "target1",
-				Labels: map[string]string{
-					"key1": "value1",
+			deployTargets: map[string]*DeployTarget[struct{}]{
+				"target1": {
+					Name: "target1",
+					Labels: map[string]string{
+						"key1": "value1",
+					},
 				},
 			},
 		},
@@ -108,7 +100,6 @@ spec: {}
 							Name: "Resource 1",
 						},
 					},
-					HealthStatus: ApplicationHealthStateHealthy,
 				},
 				SyncState: ApplicationSyncState{
 					Status: ApplicationSyncStateSynced,
@@ -163,6 +154,7 @@ spec: {}
 		})
 	}
 }
+
 func TestApplicationLiveState_toModel(t *testing.T) {
 	t.Parallel()
 
@@ -173,28 +165,81 @@ func TestApplicationLiveState_toModel(t *testing.T) {
 		expected *model.ApplicationLiveState
 	}{
 		{
-			name: "convert ApplicationLiveState to model",
+			name: "convert ApplicationLiveState to model with healthy resource",
 			input: ApplicationLiveState{
 				Resources: []ResourceState{
 					{
-						ID:        "resource1",
-						Name:      "Resource 1",
-						CreatedAt: now,
+						ID:           "resource1",
+						Name:         "Resource 1",
+						HealthStatus: ResourceHealthStateHealthy,
+						CreatedAt:    now,
 					},
 				},
-				HealthStatus: ApplicationHealthStateHealthy,
 			},
 			expected: &model.ApplicationLiveState{
 				Resources: []*model.ResourceState{
 					{
-						Id:         "resource1",
-						Name:       "Resource 1",
-						PluginName: "test-plugin",
-						CreatedAt:  now.Unix(),
-						UpdatedAt:  now.Unix(),
+						Id:           "resource1",
+						Name:         "Resource 1",
+						PluginName:   "test-plugin",
+						HealthStatus: model.ResourceState_HEALTHY,
+						CreatedAt:    now.Unix(),
+						UpdatedAt:    now.Unix(),
 					},
 				},
 				HealthStatus: model.ApplicationLiveState_HEALTHY,
+			},
+		},
+		{
+			name: "convert ApplicationLiveState to model with unhealthy resource",
+			input: ApplicationLiveState{
+				Resources: []ResourceState{
+					{
+						ID:           "resource1",
+						Name:         "Resource 1",
+						HealthStatus: ResourceHealthStateUnhealthy,
+						CreatedAt:    now,
+					},
+				},
+			},
+			expected: &model.ApplicationLiveState{
+				Resources: []*model.ResourceState{
+					{
+						Id:           "resource1",
+						Name:         "Resource 1",
+						PluginName:   "test-plugin",
+						HealthStatus: model.ResourceState_UNHEALTHY,
+						CreatedAt:    now.Unix(),
+						UpdatedAt:    now.Unix(),
+					},
+				},
+				HealthStatus: model.ApplicationLiveState_OTHER,
+			},
+		},
+		{
+			name: "convert ApplicationLiveState to model with unknown health status resource",
+			input: ApplicationLiveState{
+				Resources: []ResourceState{
+					{
+						ID:           "resource1",
+						Name:         "Resource 1",
+						HealthStatus: ResourceHealthStateUnknown,
+						CreatedAt:    now,
+					},
+				},
+			},
+			expected: &model.ApplicationLiveState{
+				Resources: []*model.ResourceState{
+					{
+						Id:           "resource1",
+						Name:         "Resource 1",
+						PluginName:   "test-plugin",
+						HealthStatus: model.ResourceState_UNKNOWN,
+						CreatedAt:    now.Unix(),
+						UpdatedAt:    now.Unix(),
+					},
+				},
+				HealthStatus: model.ApplicationLiveState_UNKNOWN,
 			},
 		},
 	}
@@ -386,6 +431,63 @@ func TestApplicationSyncStatus_toModel(t *testing.T) {
 
 			result := tt.input.toModel()
 			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestApplicationLiveState_healthStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		resources []ResourceState
+		expected  ApplicationHealthStatus
+	}{
+		{
+			name: "all healthy",
+			resources: []ResourceState{
+				{HealthStatus: ResourceHealthStateHealthy},
+			},
+			expected: ApplicationHealthStateHealthy,
+		},
+		{
+			name: "one unhealthy, none unknown",
+			resources: []ResourceState{
+				{HealthStatus: ResourceHealthStateHealthy},
+				{HealthStatus: ResourceHealthStateUnhealthy},
+			},
+			expected: ApplicationHealthStateOther,
+		},
+		{
+			name: "one unknown, others healthy",
+			resources: []ResourceState{
+				{HealthStatus: ResourceHealthStateHealthy},
+				{HealthStatus: ResourceHealthStateUnknown},
+			},
+			expected: ApplicationHealthStateUnknown,
+		},
+		{
+			name: "one unknown, one unhealthy",
+			resources: []ResourceState{
+				{HealthStatus: ResourceHealthStateUnhealthy},
+				{HealthStatus: ResourceHealthStateUnknown},
+			},
+			expected: ApplicationHealthStateUnknown,
+		},
+		{
+			name:      "empty resources",
+			resources: []ResourceState{},
+			expected:  ApplicationHealthStateHealthy,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &ApplicationLiveState{Resources: tt.resources}
+			result := s.healthStatus()
+			if result != tt.expected {
+				t.Errorf("expected %v, got %v", tt.expected, result)
+			}
 		})
 	}
 }

@@ -164,12 +164,11 @@ func (r *repo) Copy(dest string) (Worktree, error) {
 }
 
 // CopyToModify does cloning the repository to the given destination.
-// This method clones the repository from remote origin to the given destination, not from local repository.
 // The repository is cloned to the given destination with the .
 // NOTE: the given “dest” must be a path that doesn’t exist yet.
 // If you don't, you will get an error.
 func (r *repo) CopyToModify(dest string) (Repo, error) {
-	cmd := exec.Command(r.gitPath, "clone", "--filter=tree:0", "--branch", r.clonedBranch, r.remote, dest)
+	cmd := exec.Command(r.gitPath, "clone", r.dir, dest)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, formatCommandError(err, out)
 	}
@@ -186,6 +185,16 @@ func (r *repo) CopyToModify(dest string) (Repo, error) {
 		if err := cloned.setUser(context.Background(), r.username, r.email); err != nil {
 			return nil, fmt.Errorf("failed to set user: %v", err)
 		}
+	}
+
+	// because we did a local cloning so set the remote url of origin
+	if err := cloned.setRemote(context.Background(), r.remote); err != nil {
+		return nil, err
+	}
+
+	// fetch the latest changes which doesn't exist in the local repository
+	if out, err := cloned.runGitCommand(context.Background(), "fetch"); err != nil {
+		return nil, formatCommandError(err, out)
 	}
 
 	return cloned, nil
@@ -283,11 +292,27 @@ func (r *repo) CheckoutPullRequest(ctx context.Context, number int, branch strin
 
 // Pull fetches from and integrate with a local branch.
 func (r *repo) Pull(ctx context.Context, branch string) error {
-	out, err := r.runGitCommand(ctx, "pull", r.remote, branch)
-	if err != nil {
-		return formatCommandError(err, out)
+	out, err := r.runGitCommand(ctx, "pull", "--ff-only", r.remote, branch)
+
+	if err == nil {
+		return nil
 	}
-	return nil
+	// Handle "divergent branches" error, caused by amending the remote
+	if strings.Contains(string(out), "Not possible to fast-forward") {
+		// need to use --force to move the remote-ref to the new commit
+		// when the update is a non-fast-forward one like divergent branches
+		out, err := r.runGitCommand(ctx, "fetch", r.remote, branch, "--force")
+		if err != nil {
+			return formatCommandError(err, out)
+		}
+		// because we want our local to exactly replicate the remote
+		out, err = r.runGitCommand(ctx, "reset", "--hard", "FETCH_HEAD")
+		if err != nil {
+			return formatCommandError(err, out)
+		}
+		return nil
+	}
+	return formatCommandError(err, out)
 }
 
 // MergeRemoteBranch merges all commits until the given one

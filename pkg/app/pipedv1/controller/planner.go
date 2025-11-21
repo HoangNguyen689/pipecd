@@ -23,6 +23,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/atomic"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/controller/controllermetrics"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/deploysource"
+	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/metadatastore"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin"
 	"github.com/pipe-cd/pipecd/pkg/app/server/service/pipedservice"
 	config "github.com/pipe-cd/pipecd/pkg/configv1"
@@ -71,6 +73,9 @@ type planner struct {
 	// which encrypted using PipeCD built-in secret management.
 	secretDecrypter secretDecrypter
 
+	// The metadataStore is used to get the application notification config.
+	medatadaStore metadatastore.MetadataStore
+
 	// The pluginRegistry is used to determine which plugins to be used
 	pluginRegistry plugin.PluginRegistry
 
@@ -96,6 +101,7 @@ func newPlanner(
 	gitClient gitClient,
 	notifier notifier,
 	secretDecrypter secretDecrypter,
+	metadataStore metadatastore.MetadataStore,
 	logger *zap.Logger,
 	tracerProvider trace.TracerProvider,
 ) *planner {
@@ -104,7 +110,7 @@ func newPlanner(
 		zap.String("deployment-id", d.Id),
 		zap.String("app-id", d.ApplicationId),
 		zap.String("project-id", d.ProjectId),
-		zap.String("app-kind", d.Kind.String()),
+		zap.String("labels", d.GetLabelsString()),
 		zap.String("working-dir", workingDir),
 	)
 
@@ -118,6 +124,7 @@ func newPlanner(
 		gitClient:                    gitClient,
 		notifier:                     notifier,
 		secretDecrypter:              secretDecrypter,
+		medatadaStore:                metadataStore,
 		doneDeploymentStatus:         d.Status,
 		cancelledCh:                  make(chan *model.ReportableCommand, 1),
 		nowFunc:                      time.Now,
@@ -172,8 +179,8 @@ func (p *planner) Run(ctx context.Context) error {
 		"Plan",
 		trace.WithAttributes(
 			attribute.String("application-id", p.deployment.ApplicationId),
-			attribute.String("kind", p.deployment.Kind.String()),
 			attribute.String("deployment-id", p.deployment.Id),
+			attribute.String("labels", p.deployment.GetLabelsString()),
 		))
 	defer span.End()
 
@@ -289,102 +296,10 @@ func (p *planner) buildPlan(ctx context.Context, runningDS, targetDS *common.Dep
 		}
 	}
 
-	// In case the strategy has been decided by trigger.
-	// For example: user triggered the deployment via web console.
-	switch p.deployment.Trigger.SyncStrategy {
-	case model.SyncStrategy_QUICK_SYNC:
-		if stages, err := p.buildQuickSyncStages(ctx, spec); err == nil {
-			out.SyncStrategy = model.SyncStrategy_QUICK_SYNC
-			out.Summary = p.deployment.Trigger.StrategySummary
-			out.Stages = stages
-			return out, nil
-		}
-	case model.SyncStrategy_PIPELINE:
-		if stages, err := p.buildPipelineSyncStages(ctx, spec); err == nil {
-			out.SyncStrategy = model.SyncStrategy_PIPELINE
-			out.Summary = p.deployment.Trigger.StrategySummary
-			out.Stages = stages
-			return out, nil
-		}
-	}
-
-	// When no pipeline was configured, do the quick sync.
-	if spec.Pipeline == nil || len(spec.Pipeline.Stages) == 0 {
-		if stages, err := p.buildQuickSyncStages(ctx, spec); err == nil {
-			out.SyncStrategy = model.SyncStrategy_QUICK_SYNC
-			out.Summary = "Quick sync due to the pipeline was not configured"
-			out.Stages = stages
-			return out, nil
-		}
-	}
-
-	// Force to use pipeline when the `spec.planner.alwaysUsePipeline` was configured.
-	if spec.Planner.AlwaysUsePipeline {
-		if stages, err := p.buildPipelineSyncStages(ctx, spec); err == nil {
-			out.SyncStrategy = model.SyncStrategy_PIPELINE
-			out.Summary = "Sync with the specified pipeline (alwaysUsePipeline was set)"
-			out.Stages = stages
-			return out, nil
-		}
-	}
-
-	regexPool := regexpool.DefaultPool()
-
-	// This deployment is triggered by a commit with the intent to perform pipeline.
-	// Commit Matcher will be ignored when triggered by a command.
-	if pattern := spec.CommitMatcher.Pipeline; pattern != "" && p.deployment.Trigger.Commander == "" {
-		if pipelineRegex, err := regexPool.Get(pattern); err == nil &&
-			pipelineRegex.MatchString(p.deployment.Trigger.Commit.Message) {
-			if stages, err := p.buildPipelineSyncStages(ctx, spec); err == nil {
-				out.SyncStrategy = model.SyncStrategy_PIPELINE
-				out.Summary = fmt.Sprintf("Sync progressively because the commit message was matching %q", pattern)
-				out.Stages = stages
-				return out, nil
-			}
-		}
-	}
-
-	// This deployment is triggered by a commit with the intent to synchronize.
-	// Commit Matcher will be ignored when triggered by a command.
-	if pattern := spec.CommitMatcher.QuickSync; pattern != "" && p.deployment.Trigger.Commander == "" {
-		if syncRegex, err := regexPool.Get(pattern); err == nil &&
-			syncRegex.MatchString(p.deployment.Trigger.Commit.Message) {
-			if stages, err := p.buildQuickSyncStages(ctx, spec); err == nil {
-				out.SyncStrategy = model.SyncStrategy_QUICK_SYNC
-				out.Summary = fmt.Sprintf("Quick sync because the commit message was matching %q", pattern)
-				out.Stages = stages
-				return out, nil
-			}
-		}
-	}
-
-	// Quick sync if this is the first time to deploy this application or it was unable to retrieve running commit hash.
-	if p.lastSuccessfulCommitHash == "" {
-		if stages, err := p.buildQuickSyncStages(ctx, spec); err == nil {
-			out.SyncStrategy = model.SyncStrategy_QUICK_SYNC
-			out.Summary = "Quick sync, it seems this is the first deployment of the application"
-			out.Stages = stages
-			return out, nil
-		}
-	}
-
-	var (
-		strategy model.SyncStrategy
-		summary  string
-	)
-	// Build plan based on plugins determined strategy
-	for _, plg := range plugins {
-		res, err := plg.DetermineStrategy(ctx, &deployment.DetermineStrategyRequest{Input: input})
-		if err != nil {
-			p.logger.Warn("Unable to determine strategy using current plugin", zap.Error(err))
-			continue
-		}
-		strategy = res.SyncStrategy
-		summary = res.Summary
-		// If one of plugins returns PIPELINE_SYNC, use that as strategy intermediately
-		if strategy == model.SyncStrategy_PIPELINE {
-			break
-		}
+	strategy, summary, err := DetermineStrategy(ctx, spec, plugins, input, p.deployment.GetTrigger(), p.lastSuccessfulCommitHash, p.logger)
+	if err != nil {
+		p.logger.Error("unable to determine strategy", zap.Error(err))
+		return nil, err
 	}
 
 	switch strategy {
@@ -407,11 +322,85 @@ func (p *planner) buildPlan(ctx context.Context, runningDS, targetDS *common.Dep
 	return nil, fmt.Errorf("unable to plan the deployment")
 }
 
+func DetermineStrategy(
+	ctx context.Context,
+	spec *config.GenericApplicationSpec,
+	plugins []pluginapi.PluginClient,
+	input *deployment.PlanPluginInput,
+	trigger *model.DeploymentTrigger,
+	lastSuccessfulCommitHash string,
+	logger *zap.Logger,
+) (strategy model.SyncStrategy, summary string, err error) {
+	// In case the strategy has been decided by trigger.
+	// For example: user triggered the deployment via web console.
+	switch trigger.SyncStrategy {
+	case model.SyncStrategy_QUICK_SYNC:
+		return model.SyncStrategy_QUICK_SYNC, trigger.StrategySummary, nil
+	case model.SyncStrategy_PIPELINE:
+		return model.SyncStrategy_PIPELINE, trigger.StrategySummary, nil
+	}
+
+	// When no pipeline was configured, do the quick sync.
+	if spec.Pipeline == nil || len(spec.Pipeline.Stages) == 0 {
+		return model.SyncStrategy_QUICK_SYNC, "Quick sync due to the pipeline was not configured", nil
+	}
+
+	// Force to use pipeline when the `spec.planner.alwaysUsePipeline` was configured.
+	if spec.Planner.AlwaysUsePipeline {
+		return model.SyncStrategy_PIPELINE, "Sync with the specified pipeline (alwaysUsePipeline was set)", nil
+	}
+
+	regexPool := regexpool.DefaultPool()
+
+	// This deployment is triggered by a commit with the intent to perform pipeline.
+	// Commit Matcher will be ignored when triggered by a command.
+	if pattern := spec.CommitMatcher.Pipeline; pattern != "" && trigger.Commander == "" {
+		if pipelineRegex, err := regexPool.Get(pattern); err == nil &&
+			pipelineRegex.MatchString(trigger.Commit.Message) {
+			return model.SyncStrategy_PIPELINE, fmt.Sprintf("Sync progressively because the commit message was matching %q", pattern), nil
+		}
+	}
+
+	// This deployment is triggered by a commit with the intent to synchronize.
+	// Commit Matcher will be ignored when triggered by a command.
+	if pattern := spec.CommitMatcher.QuickSync; pattern != "" && trigger.Commander == "" {
+		if syncRegex, err := regexPool.Get(pattern); err == nil &&
+			syncRegex.MatchString(trigger.Commit.Message) {
+			return model.SyncStrategy_QUICK_SYNC, fmt.Sprintf("Quick sync because the commit message was matching %q", pattern), nil
+		}
+	}
+
+	// Quick sync if this is the first time to deploy this application or it was unable to retrieve running commit hash.
+	if lastSuccessfulCommitHash == "" {
+		return model.SyncStrategy_QUICK_SYNC, "Quick sync, it seems this is the first deployment of the application", nil
+	}
+
+	// Build plan based on plugins determined strategy
+	for _, plg := range plugins {
+		res, err := plg.DetermineStrategy(ctx, &deployment.DetermineStrategyRequest{Input: input})
+		if err != nil {
+			logger.Warn("Unable to determine strategy using current plugin", zap.Error(err))
+			continue
+		}
+		// If the plugin does not support DetermineStrategy(), then ignore.
+		if res.Unsupported {
+			continue
+		}
+		strategy = res.SyncStrategy
+		summary = res.Summary
+		// If one of plugins returns PIPELINE_SYNC, use that as strategy intermediately
+		if strategy == model.SyncStrategy_PIPELINE {
+			break
+		}
+	}
+
+	return strategy, summary, nil
+}
+
 // buildQuickSyncStages requests all plugins and returns quick sync stage
 // from each plugins to build the deployment pipeline.
 // NOTE:
-//   - For quick sync, we expect all stages given by plugins can be performed
-//     at once regradless its order (aka. no `Stage.Requires` specified)
+//   - For quick sync, we expect all stages given by plugins can be performed in random order.
 //   - Rollback stage will always be added as the trail.
 func (p *planner) buildQuickSyncStages(ctx context.Context, cfg *config.GenericApplicationSpec) ([]*model.PipelineStage, error) {
 	var (
@@ -432,6 +421,7 @@ func (p *planner) buildQuickSyncStages(ctx context.Context, cfg *config.GenericA
 			return nil, err
 		}
 		for i := range res.Stages {
+			res.Stages[i].Id = uuid.New().String()
 			if res.Stages[i].Rollback {
 				rollbackStages = append(rollbackStages, res.Stages[i])
 			} else {
@@ -474,12 +464,10 @@ func (p *planner) buildPipelineSyncStages(ctx context.Context, cfg *config.Gener
 		}
 
 		stagesCfgPerPlugin[plg] = append(stagesCfgPerPlugin[plg], &deployment.BuildPipelineSyncStagesRequest_StageConfig{
-			Id:      stageCfg.ID,
-			Name:    stageCfg.Name.String(),
-			Desc:    stageCfg.Desc,
-			Timeout: stageCfg.Timeout.Duration().String(),
-			Index:   int32(i),
-			Config:  stageCfg.With,
+			Name:   stageCfg.Name.String(),
+			Desc:   stageCfg.Desc,
+			Index:  int32(i),
+			Config: stageCfg.With,
 		})
 	}
 
@@ -493,8 +481,13 @@ func (p *planner) buildPipelineSyncStages(ctx context.Context, cfg *config.Gener
 			p.logger.Error("failed to build pipeline sync stages for deployment", zap.Error(err))
 			return nil, err
 		}
-		// TODO: Ensure responsed stages indexies is valid.
+		if err := validateStageIndexes(stageCfgs, res.Stages); err != nil {
+			p.logger.Error("invalid stage index was returned from a plugin", zap.Error(err))
+			return nil, err
+		}
+
 		for i := range res.Stages {
+			res.Stages[i].Id = uuid.New().String()
 			if res.Stages[i].Rollback {
 				rollbackStages = append(rollbackStages, res.Stages[i])
 			} else {
@@ -525,6 +518,41 @@ func (p *planner) buildPipelineSyncStages(ctx context.Context, cfg *config.Gener
 	return stages, nil
 }
 
+// validateStageIndexes validates the response stage indexes, including rollback stages, for two criteria:
+//   - duplication: Indexes of the response stages must not be duplicated within non-rollback stages and rollback stages.
+//     A non-rollback stage and a rollback stage can have the same index.
+//   - range: Each response stage must have a index defined in the request.
+func validateStageIndexes(req []*deployment.BuildPipelineSyncStagesRequest_StageConfig, res []*model.PipelineStage) error {
+	// check duplication
+	resIndexes := make(map[int32]struct{})
+	resRollbackIndexes := make(map[int32]struct{})
+	for _, resStage := range res {
+		if resStage.Rollback {
+			if _, ok := resRollbackIndexes[resStage.Index]; ok {
+				return fmt.Errorf("rollback stage index %d from plugin is duplicated", resStage.Index)
+			}
+			resRollbackIndexes[resStage.Index] = struct{}{}
+		} else {
+			if _, ok := resIndexes[resStage.Index]; ok {
+				return fmt.Errorf("stage index %d from plugin is duplicated", resStage.Index)
+			}
+			resIndexes[resStage.Index] = struct{}{}
+		}
+	}
+
+	// check range
+	reqIndexes := make(map[int32]struct{})
+	for _, reqStage := range req {
+		reqIndexes[reqStage.Index] = struct{}{}
+	}
+	for _, resStage := range res {
+		if _, ok := reqIndexes[resStage.Index]; !ok {
+			return fmt.Errorf("stage index %d from plugin is not defined in the request", resStage.Index)
+		}
+	}
+	return nil
+}
+
 func (p *planner) reportDeploymentPlanned(ctx context.Context, out *plannerOutput) error {
 	users, groups, err := p.getApplicationNotificationMentions(model.NotificationEventType_EVENT_DEPLOYMENT_PLANNED)
 	if err != nil {
@@ -545,6 +573,7 @@ func (p *planner) reportDeploymentPlanned(ctx context.Context, out *plannerOutpu
 
 	req := &pipedservice.ReportDeploymentPlannedRequest{
 		DeploymentId:              p.deployment.Id,
+		SyncStrategy:              out.SyncStrategy,
 		Summary:                   out.Summary,
 		StatusReason:              "The deployment has been planned",
 		RunningCommitHash:         p.lastSuccessfulCommitHash,
@@ -654,7 +683,7 @@ func (p *planner) reportDeploymentCancelled(ctx context.Context, commander, reas
 
 // getApplicationNotificationMentions returns the list of users groups who should be mentioned in the notification.
 func (p *planner) getApplicationNotificationMentions(event model.NotificationEventType) ([]string, []string, error) {
-	n, ok := p.deployment.Metadata[model.MetadataKeyDeploymentNotification]
+	n, ok := p.medatadaStore.SharedGet(model.MetadataKeyDeploymentNotification)
 	if !ok {
 		return []string{}, []string{}, nil
 	}

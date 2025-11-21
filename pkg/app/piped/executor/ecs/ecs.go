@@ -40,6 +40,9 @@ const (
 	trafficRouteCanaryMetadataKey  = "canary-percentage"
 	canaryScaleMetadataKey         = "canary-scale"
 	currentListenersKey            = "current-listeners"
+	canaryTargetGroupArnKey        = "canary-target-group-arn"
+	// Force new deployment flag metadata key.
+	forceNewDeploymentKey = "force-new-deployment"
 )
 
 type registerer interface {
@@ -146,7 +149,7 @@ func applyTaskDefinition(ctx context.Context, cli provider.Client, taskDefinitio
 	return td, nil
 }
 
-func applyServiceDefinition(ctx context.Context, cli provider.Client, serviceDefinition types.Service) (*types.Service, error) {
+func applyServiceDefinition(ctx context.Context, cli provider.Client, serviceDefinition types.Service, forceNewDeployment bool) (*types.Service, error) {
 	found, err := cli.ServiceExists(ctx, *serviceDefinition.ClusterArn, *serviceDefinition.ServiceName)
 	if err != nil {
 		return nil, fmt.Errorf("unable to validate service name %s: %w", *serviceDefinition.ServiceName, err)
@@ -154,9 +157,21 @@ func applyServiceDefinition(ctx context.Context, cli provider.Client, serviceDef
 
 	var service *types.Service
 	if found {
-		service, err = cli.UpdateService(ctx, serviceDefinition)
+		service, err = cli.UpdateService(ctx, serviceDefinition, forceNewDeployment)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update ECS service %s: %w", *serviceDefinition.ServiceName, err)
+		}
+
+		currentTags, err := cli.ListTags(ctx, *service.ServiceArn)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list existing tags for ECS service %s: %w", *serviceDefinition.ServiceName, err)
+		}
+
+		tagsToRemove := findRemovedTags(currentTags, serviceDefinition.Tags)
+		if len(tagsToRemove) > 0 {
+			if err := cli.UntagResource(ctx, *service.ServiceArn, tagsToRemove); err != nil {
+				return nil, fmt.Errorf("failed to untag ECS service %s: %w", *serviceDefinition.ServiceName, err)
+			}
 		}
 		if err := cli.TagResource(ctx, *service.ServiceArn, serviceDefinition.Tags); err != nil {
 			return nil, fmt.Errorf("failed to update tags of ECS service %s: %w", *serviceDefinition.ServiceName, err)
@@ -172,6 +187,31 @@ func applyServiceDefinition(ctx context.Context, cli provider.Client, serviceDef
 	}
 
 	return service, nil
+}
+
+func findRemovedTags(currentTags, desiredTags []types.Tag) []string {
+	var tagsToRemove []string
+
+	for _, t := range currentTags {
+		// Avoid removing PipeCD-managed tags, even though they're usually set in loadServiceDefinition()
+		if provider.IsPipeCDManagedTag(*t.Key) {
+			continue
+		}
+
+		found := false
+		for _, desiredTag := range desiredTags {
+			if *desiredTag.Key == *t.Key {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			tagsToRemove = append(tagsToRemove, *t.Key)
+		}
+	}
+
+	return tagsToRemove
 }
 
 func runStandaloneTask(
@@ -253,7 +293,7 @@ func createPrimaryTaskSet(ctx context.Context, client provider.Client, service t
 	return nil
 }
 
-func sync(ctx context.Context, in *executor.Input, platformProviderName string, platformProviderCfg *config.PlatformProviderECSConfig, recreate bool, taskDefinition types.TaskDefinition, serviceDefinition types.Service, targetGroup *types.LoadBalancer) bool {
+func sync(ctx context.Context, in *executor.Input, platformProviderName string, platformProviderCfg *config.PlatformProviderECSConfig, recreate bool, forceNewDeployment bool, taskDefinition types.TaskDefinition, serviceDefinition types.Service, targetGroup *types.LoadBalancer) bool {
 	client, err := provider.DefaultRegistry().Client(platformProviderName, platformProviderCfg, in.Logger)
 	if err != nil {
 		in.LogPersister.Errorf("Unable to create ECS client for the provider %s: %v", platformProviderName, err)
@@ -268,7 +308,7 @@ func sync(ctx context.Context, in *executor.Input, platformProviderName string, 
 	}
 
 	in.LogPersister.Infof("Start applying the ECS service definition")
-	service, err := applyServiceDefinition(ctx, client, serviceDefinition)
+	service, err := applyServiceDefinition(ctx, client, serviceDefinition, forceNewDeployment)
 	if err != nil {
 		in.LogPersister.Errorf("Failed to apply service %s: %v", *serviceDefinition.ServiceName, err)
 		return false
@@ -292,7 +332,7 @@ func sync(ctx context.Context, in *executor.Input, platformProviderName string, 
 		// Scale up the service tasks count back to its desired.
 		in.LogPersister.Infof("Scale up ECS desired tasks count back to %d", cnt)
 		service.DesiredCount = cnt
-		if _, err = client.UpdateService(ctx, *service); err != nil {
+		if _, err = client.UpdateService(ctx, *service, forceNewDeployment); err != nil {
 			in.LogPersister.Errorf("Failed to turning back service tasks: %v", err)
 			return false
 		}
@@ -329,7 +369,11 @@ func rollout(ctx context.Context, in *executor.Input, platformProviderName strin
 	}
 
 	in.LogPersister.Infof("Start applying the ECS service definition")
-	service, err := applyServiceDefinition(ctx, client, serviceDefinition)
+
+	// forceNewDeployment is false since this configuration only available for QuickSync strategy.
+	forceNewDeployment := false
+
+	service, err := applyServiceDefinition(ctx, client, serviceDefinition, forceNewDeployment)
 	if err != nil {
 		in.LogPersister.Errorf("Failed to apply service %s: %v", *serviceDefinition.ServiceName, err)
 		return false
@@ -467,10 +511,34 @@ func routing(ctx context.Context, in *executor.Input, platformProviderName strin
 		return false
 	}
 
-	if err := client.ModifyListeners(ctx, currListenerArns, routingTrafficCfg); err != nil {
+	modifiedRules, err := client.ModifyListeners(ctx, currListenerArns, routingTrafficCfg)
+	if err != nil {
 		in.LogPersister.Errorf("Failed to routing traffic to PRIMARY/CANARY variants: %v", err)
+
+		if len(modifiedRules) > 0 {
+			logModifiedRules(in.LogPersister, modifiedRules)
+		}
 		return false
 	}
 
+	logModifiedRules(in.LogPersister, modifiedRules)
+
 	return true
+}
+
+// Logs information about modified ELB listener rules.
+func logModifiedRules(logPersister executor.LogPersister, modifiedRules []string) {
+	if len(modifiedRules) == 0 {
+		logPersister.Info("No ELB listener rules were modified")
+		return
+	}
+
+	if len(modifiedRules) == 1 {
+		logPersister.Infof("Modified ELB listener rule: %s", modifiedRules[0])
+	} else {
+		logPersister.Infof("Modified %d ELB listener rules:", len(modifiedRules))
+		for _, rule := range modifiedRules {
+			logPersister.Infof("  - %s", rule)
+		}
+	}
 }

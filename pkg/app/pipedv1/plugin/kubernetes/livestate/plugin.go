@@ -15,30 +15,66 @@
 package livestate
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"go.uber.org/zap"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	sdk "github.com/pipe-cd/piped-plugin-sdk-go"
+	"github.com/pipe-cd/piped-plugin-sdk-go/diff"
 
 	kubeconfig "github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/kubernetes/config"
+	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/kubernetes/livestate/store"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/kubernetes/provider"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/kubernetes/toolregistry"
-	"github.com/pipe-cd/pipecd/pkg/plugin/diff"
-	"github.com/pipe-cd/pipecd/pkg/plugin/sdk"
 )
 
-type Plugin struct{}
+var (
+	_ sdk.LivestatePlugin[kubeconfig.KubernetesPluginConfig, kubeconfig.KubernetesDeployTargetConfig, kubeconfig.KubernetesApplicationSpec] = (*Plugin)(nil)
+	_ sdk.Initializer[kubeconfig.KubernetesPluginConfig, kubeconfig.KubernetesDeployTargetConfig]                                           = (*Plugin)(nil)
+)
+
+type Plugin struct {
+	store       *store.Store
+	initialized sync.Once
+}
+
+// Initialize implements sdk.Initializer.
+func (p *Plugin) Initialize(ctx context.Context, input *sdk.InitializeInput[kubeconfig.KubernetesPluginConfig, kubeconfig.KubernetesDeployTargetConfig]) error {
+	var err error
+
+	p.initialized.Do(func() {
+		p.store, err = store.Run(ctx, input.DeployTargets, input.Logger)
+		if err != nil {
+			err = fmt.Errorf("failed to run livestate store: %w", err)
+		}
+	})
+
+	return err
+}
 
 // GetLivestate implements sdk.LivestatePlugin.
-func (p Plugin) GetLivestate(ctx context.Context, _ *sdk.ConfigNone, deployTargets []*sdk.DeployTarget[kubeconfig.KubernetesDeployTargetConfig], input *sdk.GetLivestateInput[kubeconfig.KubernetesApplicationSpec]) (*sdk.GetLivestateResponse, error) {
+func (p *Plugin) GetLivestate(ctx context.Context, _ *kubeconfig.KubernetesPluginConfig, deployTargets []*sdk.DeployTarget[kubeconfig.KubernetesDeployTargetConfig], input *sdk.GetLivestateInput[kubeconfig.KubernetesApplicationSpec]) (*sdk.GetLivestateResponse, error) {
 	if len(deployTargets) != 1 {
 		return nil, fmt.Errorf("only 1 deploy target is allowed but got %d", len(deployTargets))
 	}
 
 	deployTarget := deployTargets[0]
-	deployTargetConfig := deployTarget.Config
+
+	managedResources, err := p.store.ManagedResources(ctx, deployTarget.Name, input.Request.ApplicationID)
+	if err != nil {
+		input.Logger.Error("Failed to get livestate", zap.Error(err))
+		return nil, err
+	}
+
+	watchingResourceKinds, err := p.store.WatchingResourceKinds(deployTarget.Name)
+	if err != nil {
+		input.Logger.Error("Failed to get watching resource kinds", zap.Error(err))
+		return nil, err
+	}
 
 	cfg, err := input.Request.DeploymentSource.AppConfig()
 	if err != nil {
@@ -50,45 +86,18 @@ func (p Plugin) GetLivestate(ctx context.Context, _ *sdk.ConfigNone, deployTarge
 	// Currently, we create them every time the stage is executed beucause we can't pass input.Client.toolRegistry to the plugin when starting the plugin.
 	toolRegistry := toolregistry.NewRegistry(input.Client.ToolRegistry())
 
-	// Get the kubectl tool path.
-	kubectlPath, err := toolRegistry.Kubectl(ctx, cmp.Or(cfg.Spec.Input.KubectlVersion, deployTargetConfig.KubectlVersion))
-	if err != nil {
-		input.Logger.Error("Failed to get kubectl tool", zap.Error(err))
-		return nil, err
-	}
-
-	// Create the kubectl wrapper for the target cluster.
-	kubectl := provider.NewKubectl(kubectlPath)
-
-	// TODO: We need to implement including/excluding resources.
-	// ref; https://pipecd.dev/docs-v0.50.x/user-guide/managing-piped/configuration-reference/#kubernetesappstateinformer
-	namespacedLiveResources, clusterScopedLiveResources, err := provider.GetLiveResources(ctx, kubectl, deployTargetConfig.KubeConfigPath, input.Request.ApplicationID)
-	if err != nil {
-		input.Logger.Error("Failed to get live resources", zap.Error(err))
-		return nil, err
-	}
-
-	resourceStates := make([]sdk.ResourceState, 0, len(namespacedLiveResources)+len(clusterScopedLiveResources))
-	for _, m := range namespacedLiveResources {
-		resourceStates = append(resourceStates, m.ToResourceState(deployTarget.Name))
-	}
-	for _, m := range clusterScopedLiveResources {
-		resourceStates = append(resourceStates, m.ToResourceState(deployTarget.Name))
-	}
-
-	manifests, err := p.loadManifests(ctx, input, cfg.Spec, provider.NewLoader(toolRegistry))
+	manifests, err := p.loadManifests(ctx, input, cfg.Spec, provider.NewLoader(toolRegistry), input.Logger)
 	if err != nil {
 		input.Logger.Error("Failed to load manifests", zap.Error(err))
 		return nil, err
 	}
 
-	liveManifests := make([]provider.Manifest, 0, len(namespacedLiveResources)+len(clusterScopedLiveResources))
-	liveManifests = append(liveManifests, namespacedLiveResources...)
-	liveManifests = append(liveManifests, clusterScopedLiveResources...)
-
 	// Calculate SyncState by comparing live manifests with desired manifests
 	// TODO: Implement drift detection ignore configs
-	diffResult, err := provider.DiffList(liveManifests, manifests, input.Logger,
+	diffResult, err := provider.DiffList(
+		filterIgnoringManifests(managedResources), // live manifests are already filtered by watchingResourceKinds in the store
+		filterIgnoringManifests(onlyWatchingResourceKinds(manifests, watchingResourceKinds)),
+		input.Logger,
 		diff.WithEquateEmpty(),
 		diff.WithIgnoreAddingMapKeys(),
 		diff.WithCompareNumberAndNumericString(),
@@ -98,12 +107,22 @@ func (p Plugin) GetLivestate(ctx context.Context, _ *sdk.ConfigNone, deployTarge
 		return nil, err
 	}
 
+	liveManifests, err := p.store.Livestate(ctx, deployTarget.Name, input.Request.ApplicationID)
+	if err != nil {
+		input.Logger.Error("Failed to get livestate", zap.Error(err))
+		return nil, err
+	}
+
+	resourceStates := make([]sdk.ResourceState, 0, len(liveManifests))
+	for _, manifest := range liveManifests {
+		resourceStates = append(resourceStates, manifest.ToResourceState(deployTarget.Name))
+	}
+
 	syncState := calculateSyncState(diffResult, input.Request.DeploymentSource.CommitHash)
 
 	return &sdk.GetLivestateResponse{
 		LiveState: sdk.ApplicationLiveState{
-			Resources:    resourceStates,
-			HealthStatus: sdk.ApplicationHealthStateUnknown, // TODO: Implement health status calculation
+			Resources: resourceStates,
 		},
 		SyncState: syncState,
 	}, nil
@@ -148,13 +167,41 @@ func calculateSyncState(diffResult *provider.DiffListResult, commit string) sdk.
 	}
 }
 
+func filterIgnoringManifests(manifests []provider.Manifest) []provider.Manifest {
+	out := make([]provider.Manifest, 0, len(manifests))
+	for _, m := range manifests {
+		annotations := m.GetAnnotations()
+		if annotations[provider.LabelIgnoreDriftDirection] == provider.IgnoreDriftDetectionTrue {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func onlyWatchingResourceKinds(manifests []provider.Manifest, watchingResourceKinds []schema.GroupVersionKind) []provider.Manifest {
+	watchingMap := make(map[schema.GroupVersionKind]struct{}, len(watchingResourceKinds))
+	for _, k := range watchingResourceKinds {
+		watchingMap[k] = struct{}{}
+	}
+
+	filtered := make([]provider.Manifest, 0, len(manifests))
+	for _, m := range manifests {
+		_, ok := watchingMap[m.GroupVersionKind()]
+		if ok {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered
+}
+
 type loader interface {
 	// LoadManifests renders and loads all manifests for application.
 	LoadManifests(ctx context.Context, input provider.LoaderInput) ([]provider.Manifest, error)
 }
 
 // TODO: share this implementation with the deployment plugin
-func (p Plugin) loadManifests(ctx context.Context, input *sdk.GetLivestateInput[kubeconfig.KubernetesApplicationSpec], spec *kubeconfig.KubernetesApplicationSpec, loader loader) ([]provider.Manifest, error) {
+func (p *Plugin) loadManifests(ctx context.Context, input *sdk.GetLivestateInput[kubeconfig.KubernetesApplicationSpec], spec *kubeconfig.KubernetesApplicationSpec, loader loader, logger *zap.Logger) ([]provider.Manifest, error) {
 	manifests, err := loader.LoadManifests(ctx, provider.LoaderInput{
 		PipedID:          input.Request.PipedID,
 		AppID:            input.Request.ApplicationID,
@@ -164,9 +211,12 @@ func (p Plugin) loadManifests(ctx context.Context, input *sdk.GetLivestateInput[
 		ConfigFilename:   input.Request.DeploymentSource.ApplicationConfigFilename,
 		Manifests:        spec.Input.Manifests,
 		Namespace:        spec.Input.Namespace,
-		TemplatingMethod: provider.TemplatingMethodNone, // TODO: Implement detection of templating method or add it to the config spec.
-
-		// TODO: Define other fields for LoaderInput
+		KustomizeVersion: spec.Input.KustomizeVersion,
+		KustomizeOptions: spec.Input.KustomizeOptions,
+		HelmVersion:      spec.Input.HelmVersion,
+		HelmChart:        spec.Input.HelmChart,
+		HelmOptions:      spec.Input.HelmOptions,
+		Logger:           logger,
 	})
 
 	if err != nil {

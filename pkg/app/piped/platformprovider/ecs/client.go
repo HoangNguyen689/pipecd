@@ -87,6 +87,9 @@ func (c *client) CreateService(ctx context.Context, service types.Service) (*typ
 	if service.DeploymentController == nil || service.DeploymentController.Type != types.DeploymentControllerTypeExternal {
 		return nil, fmt.Errorf("failed to create ECS service %s: deployment controller of type EXTERNAL is required", *service.ServiceName)
 	}
+	if service.LaunchType != "" && service.CapacityProviderStrategy != nil {
+		return nil, fmt.Errorf("failed to create ECS service %s: launch type and capacity provider strategy cannot be specified together", *service.ServiceName)
+	}
 	input := &ecs.CreateServiceInput{
 		Cluster:                       service.ClusterArn,
 		ServiceName:                   service.ServiceName,
@@ -103,6 +106,12 @@ func (c *client) CreateService(ctx context.Context, service types.Service) (*typ
 		Role:                          service.RoleArn,
 		SchedulingStrategy:            service.SchedulingStrategy,
 		Tags:                          service.Tags,
+	}
+	if service.LaunchType != "" {
+		input.LaunchType = service.LaunchType
+	}
+	if service.CapacityProviderStrategy != nil {
+		input.CapacityProviderStrategy = service.CapacityProviderStrategy
 	}
 	output, err := c.ecsClient.CreateService(ctx, input)
 	if err != nil {
@@ -135,10 +144,14 @@ func (c *client) PruneServiceTasks(ctx context.Context, service types.Service) e
 	return nil
 }
 
-func (c *client) UpdateService(ctx context.Context, service types.Service) (*types.Service, error) {
+func (c *client) UpdateService(ctx context.Context, service types.Service, forceNewDeployment bool) (*types.Service, error) {
+	if service.LaunchType != "" && service.CapacityProviderStrategy != nil {
+		return nil, fmt.Errorf("failed to update ECS service %s: launch type and capacity provider strategy cannot be specified together", *service.ServiceName)
+	}
 	input := &ecs.UpdateServiceInput{
 		Cluster:              service.ClusterArn,
 		Service:              service.ServiceName,
+		ForceNewDeployment:   forceNewDeployment,
 		EnableExecuteCommand: aws.Bool(service.EnableExecuteCommand),
 		PlacementStrategy:    service.PlacementStrategy,
 		// TODO: Support update other properties of service.
@@ -150,6 +163,10 @@ func (c *client) UpdateService(ctx context.Context, service types.Service) (*typ
 	// If desiredCount is 0 or not set, keep current desiredCount because a user might use AutoScaling.
 	if service.DesiredCount != 0 {
 		input.DesiredCount = aws.Int32(service.DesiredCount)
+	}
+
+	if service.CapacityProviderStrategy != nil {
+		input.CapacityProviderStrategy = service.CapacityProviderStrategy
 	}
 
 	output, err := c.ecsClient.UpdateService(ctx, input)
@@ -241,6 +258,9 @@ func (c *client) CreateTaskSet(ctx context.Context, service types.Service, taskD
 	if taskDefinition.TaskDefinitionArn == nil {
 		return nil, fmt.Errorf("failed to create task set of task family %s: no task definition provided", *taskDefinition.Family)
 	}
+	if service.LaunchType != "" && service.CapacityProviderStrategy != nil {
+		return nil, fmt.Errorf("failed to create task set of task family %s: launch type and capacity provider strategy cannot be specified together", *taskDefinition.Family)
+	}
 
 	input := &ecs.CreateTaskSetInput{
 		Cluster:        service.ClusterArn,
@@ -251,12 +271,18 @@ func (c *client) CreateTaskSet(ctx context.Context, service types.Service, taskD
 		// If you specify the awsvpc network mode, the task is allocated an elastic network interface,
 		// and you must specify a NetworkConfiguration when run a task with the task definition.
 		NetworkConfiguration: service.NetworkConfiguration,
-		LaunchType:           service.LaunchType,
 		ServiceRegistries:    service.ServiceRegistries,
+	}
+	if service.LaunchType != "" {
+		input.LaunchType = service.LaunchType
+	}
+	if service.CapacityProviderStrategy != nil {
+		input.CapacityProviderStrategy = service.CapacityProviderStrategy
 	}
 	if targetGroup != nil {
 		input.LoadBalancers = []types.LoadBalancer{*targetGroup}
 	}
+
 	output, err := c.ecsClient.CreateTaskSet(ctx, input)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ECS task set %s: %w", *taskDefinition.TaskDefinitionArn, err)
@@ -472,17 +498,19 @@ func (c *client) getLoadBalancerArn(ctx context.Context, targetGroupArn string) 
 	return output.TargetGroups[0].LoadBalancerArns[0], nil
 }
 
-func (c *client) ModifyListeners(ctx context.Context, listenerArns []string, routingTrafficCfg RoutingTrafficConfig) error {
+func (c *client) ModifyListeners(ctx context.Context, listenerArns []string, routingTrafficCfg RoutingTrafficConfig) ([]string, error) {
 	if len(routingTrafficCfg) != 2 {
-		return fmt.Errorf("invalid listener configuration: requires 2 target groups")
+		return nil, fmt.Errorf("invalid listener configuration: requires 2 target groups")
 	}
+
+	modifiedRuleArns := make([]string, 0)
 
 	for _, listenerArn := range listenerArns {
 		describeRulesOutput, err := c.elbClient.DescribeRules(ctx, &elasticloadbalancingv2.DescribeRulesInput{
 			ListenerArn: aws.String(listenerArn),
 		})
 		if err != nil {
-			return fmt.Errorf("failed to describe rules of listener %s: %w", listenerArn, err)
+			return modifiedRuleArns, fmt.Errorf("failed to describe rules of listener %s: %w", listenerArn, err)
 		}
 
 		for _, rule := range describeRulesOutput.Rules {
@@ -519,20 +547,22 @@ func (c *client) ModifyListeners(ctx context.Context, listenerArns []string, rou
 					DefaultActions: modifiedActions,
 				})
 				if err != nil {
-					return fmt.Errorf("failed to modify default rule %s: %w", *rule.RuleArn, err)
+					return modifiedRuleArns, fmt.Errorf("failed to modify default rule %s: %w", *rule.RuleArn, err)
 				}
+				modifiedRuleArns = append(modifiedRuleArns, fmt.Sprintf("default rule of listener %s", listenerArn))
 			} else {
 				_, err := c.elbClient.ModifyRule(ctx, &elasticloadbalancingv2.ModifyRuleInput{
 					RuleArn: rule.RuleArn,
 					Actions: modifiedActions,
 				})
 				if err != nil {
-					return fmt.Errorf("failed to modify rule %s: %w", *rule.RuleArn, err)
+					return modifiedRuleArns, fmt.Errorf("failed to modify rule %s: %w", *rule.RuleArn, err)
 				}
+				modifiedRuleArns = append(modifiedRuleArns, *rule.RuleArn)
 			}
 		}
 	}
-	return nil
+	return modifiedRuleArns, nil
 }
 
 func (c *client) TagResource(ctx context.Context, resourceArn string, tags []types.Tag) error {
@@ -647,4 +677,34 @@ func (c *client) GetTaskSetTasks(ctx context.Context, taskSet types.TaskSet) ([]
 	}
 
 	return tasks, nil
+}
+
+func (c *client) ListTags(ctx context.Context, resourceArn string) ([]types.Tag, error) {
+	input := &ecs.ListTagsForResourceInput{
+		ResourceArn: aws.String(resourceArn),
+	}
+
+	output, err := c.ecsClient.ListTagsForResource(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+
+	tags := make([]types.Tag, 0, len(output.Tags))
+	for _, t := range output.Tags {
+		tags = append(tags, types.Tag{
+			Key:   t.Key,
+			Value: t.Value,
+		})
+	}
+	return tags, nil
+}
+
+func (c *client) UntagResource(ctx context.Context, resourceArn string, tagKeys []string) error {
+	input := &ecs.UntagResourceInput{
+		ResourceArn: aws.String(resourceArn),
+		TagKeys:     tagKeys,
+	}
+
+	_, err := c.ecsClient.UntagResource(ctx, input)
+	return err
 }

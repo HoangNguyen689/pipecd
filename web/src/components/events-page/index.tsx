@@ -4,15 +4,14 @@ import {
   CircularProgress,
   Divider,
   List,
-  makeStyles,
   Toolbar,
   Typography,
-} from "@material-ui/core";
-import CloseIcon from "@material-ui/icons/Close";
-import FilterIcon from "@material-ui/icons/FilterList";
-import RefreshIcon from "@material-ui/icons/Refresh";
+} from "@mui/material";
+import CloseIcon from "@mui/icons-material/Close";
+import FilterIcon from "@mui/icons-material/FilterList";
+import RefreshIcon from "@mui/icons-material/Refresh";
 import dayjs from "dayjs";
-import { FC, useCallback, useEffect, useRef, useState } from "react";
+import { FC, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useInView } from "react-intersection-observer";
 import { useNavigate } from "react-router-dom";
 import { PAGE_PATH_EVENTS } from "~/constants/path";
@@ -22,21 +21,9 @@ import {
   UI_TEXT_REFRESH,
   UI_TEXT_MORE,
 } from "~/constants/ui-text";
-import {
-  useAppDispatch,
-  useAppSelector,
-  useShallowEqualSelector,
-} from "~/hooks/redux";
-import { fetchApplications } from "~/modules/applications";
-import {
-  Event,
-  EventFilterOptions,
-  fetchEvents,
-  fetchMoreEvents,
-  selectById as selectEventById,
-  selectIds as selectEventIds,
-} from "~/modules/events";
-import { useStyles as useButtonStyles } from "~/styles/button";
+
+import { Event } from "pipecd/web/model/event_pb";
+import { SpinnerIcon } from "~/styles/button";
 import {
   stringifySearchParams,
   useSearchParams,
@@ -44,59 +31,38 @@ import {
 } from "~/utils/search-params";
 import { EventFilter } from "./event-filter";
 import { EventItem } from "./event-item";
-
-const useStyles = makeStyles((theme) => ({
-  eventLists: {
-    listStyle: "none",
-    padding: theme.spacing(3),
-    paddingTop: 0,
-    margin: 0,
-    flex: 1,
-    overflowY: "scroll",
-  },
-  date: {
-    marginTop: theme.spacing(2),
-    marginBottom: theme.spacing(2),
-  },
-}));
+import {
+  EventFilterOptions,
+  useGetEventsInfinite,
+} from "~/queries/events/use-get-events-infinite";
 
 const sortComp = (a: string | number, b: string | number): number => {
   return dayjs(b).valueOf() - dayjs(a).valueOf();
 };
 
-function filterUndefined<TValue>(value: TValue | undefined): value is TValue {
-  return value !== undefined;
-}
+const useNewGroupedEvents = (
+  events: Event.AsObject[]
+): Record<string, Event.AsObject[]> => {
+  return useMemo(() => {
+    const result: Record<string, Event.AsObject[]> = {};
 
-const useGroupedEvents = (): Record<string, Event.AsObject[]> => {
-  const events = useShallowEqualSelector<Event.AsObject[]>((state) =>
-    selectEventIds(state.events)
-      .map((id) => selectEventById(state.events, id))
-      .filter(filterUndefined)
-  );
+    events.forEach((event) => {
+      const dateStr = dayjs(event.createdAt * 1000).format("YYYY/MM/DD");
+      if (!result[dateStr]) {
+        result[dateStr] = [];
+      }
+      if (!result[dateStr].some((e) => e.id === event.id)) {
+        result[dateStr].push(event);
+      }
+    });
 
-  const result: Record<string, Event.AsObject[]> = {};
-
-  events.forEach((event) => {
-    const dateStr = dayjs(event.createdAt * 1000).format("YYYY/MM/DD");
-    if (!result[dateStr]) {
-      result[dateStr] = [];
-    }
-    result[dateStr].push(event);
-  });
-
-  return result;
+    return result;
+  }, [events]);
 };
 
 export const EventIndexPage: FC = () => {
-  const classes = useStyles();
-  const buttonClasses = useButtonStyles();
   const navigate = useNavigate();
-  const dispatch = useAppDispatch();
   const listRef = useRef(null);
-  const status = useAppSelector((state) => state.events.status);
-  const hasMore = useAppSelector((state) => state.events.hasMore);
-  const groupedEvents = useGroupedEvents();
   const filterOptions = useSearchParams();
   const [openFilter, setOpenFilter] = useState(true);
   const [ref, inView] = useInView({
@@ -104,21 +70,33 @@ export const EventIndexPage: FC = () => {
     root: listRef.current,
   });
 
-  const isLoading = status === "loading";
+  const {
+    data: eventsData,
+    isFetching,
+    fetchNextPage: fetchMoreEvents,
+    refetch: refetchEvents,
+    isSuccess,
+  } = useGetEventsInfinite(filterOptions);
 
-  useEffect(() => {
-    dispatch(fetchApplications());
-  }, [dispatch]);
+  const eventsList = useMemo(() => {
+    return eventsData?.pages.flatMap((item) => item.eventsList) || [];
+  }, [eventsData]);
 
-  useEffect(() => {
-    dispatch(fetchEvents(filterOptions));
-  }, [dispatch, filterOptions]);
-
-  useEffect(() => {
-    if (inView && hasMore && isLoading === false) {
-      dispatch(fetchMoreEvents(filterOptions));
+  const hasMore = useMemo(() => {
+    if (!eventsData || eventsData.pages.length === 0) {
+      return false;
     }
-  }, [dispatch, inView, hasMore, isLoading, filterOptions]);
+    const lastIndex = eventsData?.pages.length - 1;
+    return eventsData?.pages?.[lastIndex]?.hasMore || false;
+  }, [eventsData]);
+
+  const groupedEvents = useNewGroupedEvents(eventsList || []);
+
+  useEffect(() => {
+    if (inView && hasMore && isFetching === false) {
+      fetchMoreEvents();
+    }
+  }, [inView, isFetching, filterOptions, fetchMoreEvents, hasMore]);
 
   // filter handlers
   const handleFilterChange = useCallback(
@@ -138,29 +116,38 @@ export const EventIndexPage: FC = () => {
   }, [navigate]);
 
   const handleRefreshClick = useCallback(() => {
-    dispatch(fetchEvents(filterOptions));
-  }, [dispatch, filterOptions]);
+    refetchEvents();
+  }, [refetchEvents]);
 
   const handleMoreClick = useCallback(() => {
-    dispatch(fetchMoreEvents(filterOptions));
-  }, [dispatch, filterOptions]);
+    fetchMoreEvents();
+  }, [fetchMoreEvents]);
 
   const dates = Object.keys(groupedEvents).sort(sortComp);
 
   return (
-    <Box display="flex" overflow="hidden" flex={1} flexDirection="column">
+    <Box
+      sx={{
+        display: "flex",
+        overflow: "hidden",
+        flex: 1,
+        flexDirection: "column",
+      }}
+    >
       <Toolbar variant="dense">
-        <Box flexGrow={1} />
+        <Box
+          sx={{
+            flexGrow: 1,
+          }}
+        />
         <Button
           color="primary"
           startIcon={<RefreshIcon />}
           onClick={handleRefreshClick}
-          disabled={isLoading}
+          disabled={isFetching}
         >
           {UI_TEXT_REFRESH}
-          {isLoading && (
-            <CircularProgress size={24} className={buttonClasses.progress} />
-          )}
+          {isFetching && <SpinnerIcon />}
         </Button>
         <Button
           color="primary"
@@ -170,56 +157,81 @@ export const EventIndexPage: FC = () => {
           {openFilter ? UI_TEXT_HIDE_FILTER : UI_TEXT_FILTER}
         </Button>
       </Toolbar>
-
       <Divider />
-      <Box display="flex" overflow="hidden" flex={1}>
-        <ol className={classes.eventLists} ref={listRef}>
-          {dates.length === 0 &&
-            (isLoading ? (
-              <Box display="flex" justifyContent="center" mt={3}>
+      <Box
+        sx={{
+          display: "flex",
+          overflow: "hidden",
+          flex: 1,
+        }}
+      >
+        <Box
+          component={"ol"}
+          sx={{
+            listStyle: "none",
+            padding: 3,
+            paddingTop: 0,
+            margin: 0,
+            flex: 1,
+            overflowY: "scroll",
+          }}
+          ref={listRef}
+        >
+          {dates.length === 0 && (
+            <Box
+              sx={{
+                display: "flex",
+                justifyContent: "center",
+                mt: 3,
+              }}
+            >
+              {isFetching ? (
                 <CircularProgress />
-              </Box>
-            ) : (
-              <Box display="flex" justifyContent="center" mt={3}>
+              ) : (
                 <Typography>No events</Typography>
-              </Box>
-            ))}
+              )}
+            </Box>
+          )}
           {dates.map((date) => (
             <li key={date}>
-              <Typography variant="subtitle1" className={classes.date}>
+              <Typography
+                variant="subtitle1"
+                sx={{
+                  mt: 2,
+                  mb: 2,
+                }}
+              >
                 {date}
               </Typography>
               <List>
                 {groupedEvents[date]
                   .sort((a, b) => sortComp(a.createdAt, b.createdAt))
-                  .map((event) => (
-                    <EventItem id={event.id} key={`event-item-${event.id}`} />
-                  ))}
+                  .map((event) => {
+                    return (
+                      <EventItem event={event} key={`event-item-${event.id}`} />
+                    );
+                  })}
               </List>
             </li>
           ))}
-          {status === "succeeded" && <div ref={ref} />}
-          {!hasMore && (
+          {isSuccess && <div ref={ref} />}
+          {!eventsData?.pages?.[0]?.hasMore && (
             <Button
               color="primary"
               variant="outlined"
               size="large"
               fullWidth
               onClick={handleMoreClick}
-              disabled={isLoading}
+              disabled={isFetching}
             >
               {UI_TEXT_MORE}
-              {isLoading && (
-                <CircularProgress
-                  size={24}
-                  className={buttonClasses.progress}
-                />
-              )}
+              {isFetching && <SpinnerIcon />}
             </Button>
           )}
-        </ol>
+        </Box>
         {openFilter && (
           <EventFilter
+            events={eventsList}
             options={filterOptions}
             onChange={handleFilterChange}
             onClear={handleFilterClear}

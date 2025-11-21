@@ -58,8 +58,9 @@ type GenericApplicationSpec struct {
 	EventWatcher []EventWatcherConfig `json:"eventWatcher"`
 	// Configuration for drift detection
 	DriftDetection *DriftDetection `json:"driftDetection"`
-	// List of the plugin name
-	Plugins []string `json:"plugins"`
+	// List of the configuration for plugin
+	// This field is plugin-specific, so intentionally restrict the access for the actual value here and decode it on the SDK side.
+	Plugins map[string]struct{} `json:"plugins"`
 }
 
 type DeploymentPlanner struct {
@@ -170,14 +171,8 @@ func (s GenericApplicationSpec) GetStage(index int32) (PipelineStage, bool) {
 }
 
 // GetStageConfigByte returns the JSON-encoded byte representation of the stage config at the specified index.
-// If the pipeline is not defined, it returns nil and true. This is QuickSync specific.
 // If the stage index is invalid, it returns nil and false.
 func (s GenericApplicationSpec) GetStageConfigByte(index int32) ([]byte, bool) {
-	// Return empty byte if the pipeline is not defined.
-	if len(s.Pipeline.Stages) == 0 {
-		return nil, true
-	}
-
 	stage, ok := s.GetStage(index)
 	if !ok {
 		return nil, false
@@ -218,11 +213,10 @@ type DeploymentPipeline struct {
 // PipelineStage represents a single stage of a pipeline.
 // This is used as a generic struct for all stage type.
 type PipelineStage struct {
-	ID      string          `json:"id"`
 	Name    model.Stage     `json:"name"`
 	Desc    string          `json:"desc,omitempty"`
-	Timeout Duration        `json:"timeout"`
-	With    json.RawMessage `json:"with"`
+	Timeout Duration        `json:"timeout" default:"6h"`
+	With    json.RawMessage `json:"with" default:"{}"`
 	SkipOn  SkipOptions     `json:"skipOn,omitempty"`
 }
 
@@ -260,91 +254,6 @@ func (c *CustomSyncOptions) Validate() error {
 		return fmt.Errorf("the CUSTOM_SYNC stage requires run field")
 	}
 	return nil
-}
-
-// AnalysisStageOptions contains all configurable values for a K8S_ANALYSIS stage.
-type AnalysisStageOptions struct {
-	// How long the analysis process should be executed.
-	Duration Duration `json:"duration,omitempty"`
-	// TODO: Consider about how to handle a pod restart
-	// possible count of pod restarting
-	RestartThreshold int                          `json:"restartThreshold,omitempty"`
-	Metrics          []TemplatableAnalysisMetrics `json:"metrics,omitempty"`
-	Logs             []TemplatableAnalysisLog     `json:"logs,omitempty"`
-	HTTPS            []TemplatableAnalysisHTTP    `json:"https,omitempty"`
-	SkipOn           SkipOptions                  `json:"skipOn,omitempty"`
-}
-
-func (a *AnalysisStageOptions) Validate() error {
-	if a.Duration == 0 {
-		return fmt.Errorf("the ANALYSIS stage requires duration field")
-	}
-
-	for _, m := range a.Metrics {
-		if m.Template.Name != "" {
-			if err := m.Template.Validate(); err != nil {
-				return fmt.Errorf("one of metrics configurations of ANALYSIS stage is invalid: %w", err)
-			}
-			continue
-		}
-		if err := m.AnalysisMetrics.Validate(); err != nil {
-			return fmt.Errorf("one of metrics configurations of ANALYSIS stage is invalid: %w", err)
-		}
-	}
-
-	for _, l := range a.Logs {
-		if l.Template.Name != "" {
-			if err := l.Template.Validate(); err != nil {
-				return fmt.Errorf("one of log configurations of ANALYSIS stage is invalid: %w", err)
-			}
-			continue
-		}
-		if err := l.AnalysisLog.Validate(); err != nil {
-			return fmt.Errorf("one of log configurations of ANALYSIS stage is invalid: %w", err)
-		}
-	}
-	for _, h := range a.HTTPS {
-		if h.Template.Name != "" {
-			if err := h.Template.Validate(); err != nil {
-				return fmt.Errorf("one of http configurations of ANALYSIS stage is invalid: %w", err)
-			}
-			continue
-		}
-		if err := h.AnalysisHTTP.Validate(); err != nil {
-			return fmt.Errorf("one of http configurations of ANALYSIS stage is invalid: %w", err)
-		}
-	}
-	return nil
-}
-
-type AnalysisTemplateRef struct {
-	Name    string            `json:"name"`
-	AppArgs map[string]string `json:"appArgs"`
-}
-
-func (a *AnalysisTemplateRef) Validate() error {
-	if a.Name == "" {
-		return fmt.Errorf("the reference of analysis template name is empty")
-	}
-	return nil
-}
-
-// TemplatableAnalysisMetrics wraps AnalysisMetrics to allow specify template to use.
-type TemplatableAnalysisMetrics struct {
-	AnalysisMetrics
-	Template AnalysisTemplateRef `json:"template"`
-}
-
-// TemplatableAnalysisLog wraps AnalysisLog to allow specify template to use.
-type TemplatableAnalysisLog struct {
-	AnalysisLog
-	Template AnalysisTemplateRef `json:"template"`
-}
-
-// TemplatableAnalysisHTTP wraps AnalysisHTTP to allow specify template to use.
-type TemplatableAnalysisHTTP struct {
-	AnalysisHTTP
-	Template AnalysisTemplateRef `json:"template"`
 }
 
 type SecretEncryption struct {
@@ -549,7 +458,7 @@ type DeploymentChainTriggerCondition struct {
 func (c *DeploymentChainTriggerCondition) Validate() error {
 	hasCond := c.CommitPrefix != ""
 	if !hasCond {
-		return fmt.Errorf("missing commitPrefix configration as deployment chain trigger condition")
+		return fmt.Errorf("missing commitPrefix configuration as deployment chain trigger condition")
 	}
 	return nil
 }

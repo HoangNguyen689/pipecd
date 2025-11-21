@@ -1,4 +1,4 @@
-import { Piped, PipedKey } from "~/modules/pipeds";
+import { Piped, PipedKey } from "pipecd/web/model/piped_pb";
 import { createApplicationGitRepository, dummyRepo } from "./dummy-repo";
 import { createRandTimes, randomText, randomUUID } from "./utils";
 
@@ -74,6 +74,14 @@ export function createPipedFromObject(o: Piped.AsObject): Piped {
   piped.setStartedAt(o.startedAt);
   piped.setUpdatedAt(o.updatedAt);
   piped.setDisabled(o.disabled);
+  piped.setPluginsList(
+    o.pluginsList.map((p) => {
+      const plugin = new Piped.Plugin();
+      plugin.setName(p.name);
+      plugin.setDeployTargetsList(p.deployTargetsList);
+      return plugin;
+    })
+  );
   piped.setRepositoriesList(
     o.repositoriesList.map(createApplicationGitRepository)
   );

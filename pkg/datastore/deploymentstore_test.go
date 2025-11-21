@@ -32,9 +32,9 @@ func TestDeploymentToPlannedUpdater(t *testing.T) {
 	var (
 		expectedDesc                  = "updated-summary"
 		expectedStatusDesc            = "update-status-desc"
+		expectedSyncStrategy          = model.SyncStrategy_QUICK_SYNC
 		expectedRunningCommitHash     = "update-running-commit-hash"
 		expectedRunningConfigFilename = "update-running-config-filename"
-		expectedVersion               = "update-version"
 		expectedVersions              = []*model.ArtifactVersion{
 			{
 				Kind:    model.ArtifactVersion_CONTAINER_IMAGE,
@@ -62,7 +62,10 @@ func TestDeploymentToPlannedUpdater(t *testing.T) {
 			Summary:      "summary",
 			StatusReason: "status-reason",
 			Status:       model.DeploymentStatus_DEPLOYMENT_PENDING,
-			Stages:       []*model.PipelineStage{},
+			Trigger: &model.DeploymentTrigger{
+				SyncStrategy: model.SyncStrategy_AUTO,
+			},
+			Stages: []*model.PipelineStage{},
 		}
 
 		updater = toPlannedUpdateFunc(
@@ -70,7 +73,7 @@ func TestDeploymentToPlannedUpdater(t *testing.T) {
 			expectedStatusDesc,
 			expectedRunningCommitHash,
 			expectedRunningConfigFilename,
-			expectedVersion,
+			expectedSyncStrategy,
 			expectedVersions,
 			expectedStages,
 		)
@@ -83,7 +86,7 @@ func TestDeploymentToPlannedUpdater(t *testing.T) {
 	assert.Equal(t, expectedStatusDesc, d.StatusReason)
 	assert.Equal(t, expectedRunningCommitHash, d.RunningCommitHash)
 	assert.Equal(t, expectedRunningConfigFilename, d.RunningConfigFilename)
-	assert.Equal(t, expectedVersion, d.Version)
+	assert.Equal(t, expectedSyncStrategy, d.Trigger.SyncStrategy)
 	assert.Equal(t, expectedVersions, d.Versions)
 	assert.Equal(t, expectedStages, d.Stages)
 }
@@ -365,7 +368,7 @@ func TestAddDeployment(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := NewDeploymentStore(tc.dsFactory(tc.deployment), TestCommander)
+			s := NewDeploymentStore(tc.dsFactory(tc.deployment))
 			err := s.Add(context.Background(), tc.deployment)
 			assert.Equal(t, tc.wantErr, err != nil)
 		})
@@ -410,7 +413,7 @@ func TestGetDeployment(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := NewDeploymentStore(tc.ds, TestCommander)
+			s := NewDeploymentStore(tc.ds)
 			_, err := s.Get(context.Background(), tc.id)
 			assert.Equal(t, tc.wantErr, err != nil)
 		})
@@ -465,7 +468,7 @@ func TestListDeployments(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := NewDeploymentStore(tc.ds, TestCommander)
+			s := NewDeploymentStore(tc.ds)
 			_, _, err := s.List(context.Background(), tc.opts)
 			assert.Equal(t, tc.wantErr, err != nil)
 		})

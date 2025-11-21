@@ -30,7 +30,6 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/kubernetes_multicluster/config"
-	"github.com/pipe-cd/pipecd/pkg/model"
 )
 
 type TemplatingMethod string
@@ -53,8 +52,7 @@ type LoaderInput struct {
 	ConfigFilename string
 	Manifests      []string
 
-	Namespace        string
-	TemplatingMethod TemplatingMethod
+	Namespace string
 
 	KustomizeVersion string
 	KustomizeOptions map[string]string
@@ -83,6 +81,35 @@ func NewLoader(registry ToolRegistry) *Loader {
 	}
 }
 
+func (l *Loader) determineTemplatingMethod(input LoaderInput) TemplatingMethod {
+	if input.HelmChart != nil {
+		return TemplatingMethodHelm
+	}
+	if isKustomizationFileExists(input.AppDir) {
+		return TemplatingMethodKustomize
+	}
+	return TemplatingMethodNone
+}
+
+// isKustomizationFileExists checks if a kustomization file exists in the given directory.
+// There are 3 files name considered as kustomization file:
+// - kustomization.yaml
+// - kustomization.yml
+// - Kustomization
+func isKustomizationFileExists(appDirPath string) bool {
+	recognizedKustomizationFileNames := []string{
+		"kustomization.yaml",
+		"kustomization.yml",
+		"Kustomization",
+	}
+	for _, fileName := range recognizedKustomizationFileNames {
+		if _, err := os.Stat(filepath.Join(appDirPath, fileName)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (l *Loader) LoadManifests(ctx context.Context, input LoaderInput) (manifests []Manifest, err error) {
 	defer func() {
 		for i := range manifests {
@@ -91,29 +118,14 @@ func (l *Loader) LoadManifests(ctx context.Context, input LoaderInput) (manifest
 			if input.Namespace != "" {
 				manifests[i].body.SetNamespace(input.Namespace)
 			}
-
-			// Add builtin labels and annotations for tracking application live state.
-			manifests[i].AddLabels(map[string]string{
-				LabelManagedBy:   ManagedByPiped,
-				LabelPiped:       input.PipedID,
-				LabelApplication: input.AppID,
-				LabelCommitHash:  input.CommitHash,
-			})
-
-			manifests[i].AddAnnotations(map[string]string{
-				LabelManagedBy:          ManagedByPiped,
-				LabelPiped:              input.PipedID,
-				LabelApplication:        input.AppID,
-				LabelOriginalAPIVersion: manifests[i].body.GetAPIVersion(),
-				LabelResourceKey:        manifests[i].Key().String(),
-				LabelCommitHash:         input.CommitHash,
-			})
 		}
 
 		sortManifests(manifests)
 	}()
 
-	switch input.TemplatingMethod {
+	templatingMethod := l.determineTemplatingMethod(input)
+
+	switch templatingMethod {
 	case TemplatingMethodHelm:
 		data, err := l.templateHelmChart(ctx, input)
 		if err != nil {
@@ -131,7 +143,7 @@ func (l *Loader) LoadManifests(ctx context.Context, input LoaderInput) (manifest
 	case TemplatingMethodNone:
 		return LoadPlainYAMLManifests(input.AppDir, input.Manifests, input.ConfigFilename)
 	default:
-		return nil, fmt.Errorf("unsupported templating method %s", input.TemplatingMethod)
+		return nil, fmt.Errorf("unsupported templating method %s", templatingMethod)
 	}
 }
 
@@ -205,10 +217,6 @@ func LoadPlainYAMLManifests(dir string, names []string, configFilename string) (
 				return fs.SkipDir
 			}
 			if ext := filepath.Ext(d.Name()); ext != ".yaml" && ext != ".yml" && ext != ".json" {
-				return nil
-			}
-			if model.IsApplicationConfigFile(d.Name()) {
-				// MEMO: can we remove this check because we have configFilename?
 				return nil
 			}
 			if d.Name() == configFilename {

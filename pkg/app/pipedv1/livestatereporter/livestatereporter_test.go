@@ -52,6 +52,7 @@ func (f *fakeAPIClient) ReportApplicationSyncState(ctx context.Context, req *pip
 // TODO: make lib for fakePlugin to use in other tests
 type fakePlugin struct {
 	pluginapi.PluginClient
+	name           string
 	syncStrategy   *deployment.DetermineStrategyResponse
 	quickStages    []*model.PipelineStage
 	pipelineStages []*model.PipelineStage
@@ -70,9 +71,9 @@ func (p *fakePlugin) BuildQuickSyncStages(ctx context.Context, req *deployment.B
 	}, nil
 }
 func (p *fakePlugin) BuildPipelineSyncStages(ctx context.Context, req *deployment.BuildPipelineSyncStagesRequest, opts ...grpc.CallOption) (*deployment.BuildPipelineSyncStagesResponse, error) {
-	getIndex := func(stageID string) int32 {
+	getIndex := func(stageName string) int32 {
 		for _, s := range req.Stages {
-			if s.Id == stageID {
+			if s.Name == stageName {
 				return s.Index
 			}
 		}
@@ -80,7 +81,7 @@ func (p *fakePlugin) BuildPipelineSyncStages(ctx context.Context, req *deploymen
 	}
 
 	for _, s := range p.pipelineStages {
-		s.Index = getIndex(s.Id)
+		s.Index = getIndex(s.Name)
 	}
 
 	if req.Rollback {
@@ -121,6 +122,9 @@ func (p *fakePlugin) GetLivestate(ctx context.Context, in *livestate.GetLivestat
 		ApplicationLiveState: &model.ApplicationLiveState{},
 		SyncState:            &model.ApplicationSyncState{},
 	}, nil
+}
+func (p *fakePlugin) Name() string {
+	return p.name
 }
 
 type fakeAPILister struct {

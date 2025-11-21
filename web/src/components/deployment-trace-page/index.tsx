@@ -3,21 +3,20 @@ import {
   Button,
   CircularProgress,
   Divider,
-  makeStyles,
   Toolbar,
   Typography,
-} from "@material-ui/core";
-import { FC, useCallback, useEffect, useRef, useState } from "react";
-import CloseIcon from "@material-ui/icons/Close";
-import FilterIcon from "@material-ui/icons/FilterList";
-import RefreshIcon from "@material-ui/icons/Refresh";
+} from "@mui/material";
+import { FC, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import CloseIcon from "@mui/icons-material/Close";
+import FilterIcon from "@mui/icons-material/FilterList";
+import RefreshIcon from "@mui/icons-material/Refresh";
 import {
   UI_TEXT_FILTER,
   UI_TEXT_HIDE_FILTER,
   UI_TEXT_MORE,
   UI_TEXT_REFRESH,
 } from "~/constants/ui-text";
-import { useStyles as useButtonStyles } from "~/styles/button";
+import { SpinnerIcon } from "~/styles/button";
 import DeploymentTraceFilter from "./deployment-trace-filter";
 import { useNavigate } from "react-router-dom";
 import { PAGE_PATH_DEPLOYMENT_TRACE } from "~/constants/path";
@@ -26,43 +25,15 @@ import {
   stringifySearchParams,
   useSearchParams,
 } from "~/utils/search-params";
-import { useAppDispatch, useAppSelector } from "~/hooks/redux";
-import {
-  fetchDeploymentTraces,
-  fetchMoreDeploymentTraces,
-} from "~/modules/deploymentTrace";
 import useGroupedDeploymentTrace from "./useGroupedDeploymentTrace";
 import DeploymentTraceItem from "./deployment-trace-item";
 import { useInView } from "react-intersection-observer";
+import { useGetDeploymentTracesInfinite } from "~/queries/deployment-traces/use-deployment-traces-infinite";
 
-const useStyles = makeStyles((theme) => ({
-  list: {
-    listStyle: "none",
-    padding: theme.spacing(3),
-    paddingTop: 0,
-    margin: 0,
-    flex: 1,
-    overflowY: "scroll",
-  },
-  listDeployment: {
-    backgroundColor: theme.palette.background.paper,
-  },
-  date: {
-    marginTop: theme.spacing(2),
-    marginBottom: theme.spacing(2),
-  },
-}));
 const DeploymentTracePage: FC = () => {
-  const classes = useStyles();
   const [openFilter, setOpenFilter] = useState(true);
-  const dispatch = useAppDispatch();
-  const buttonClasses = useButtonStyles();
-  const status = useAppSelector((state) => state.deploymentTrace.status);
-  const hasMore = useAppSelector((state) => state.deploymentTrace.hasMore);
   const navigate = useNavigate();
   const filterValues = useSearchParams();
-  const { dates, deploymentTracesMap } = useGroupedDeploymentTrace();
-  const isLoading = status === "loading";
 
   const listRef = useRef(null);
   const [ref, inView] = useInView({
@@ -70,23 +41,44 @@ const DeploymentTracePage: FC = () => {
     root: listRef.current,
   });
 
-  useEffect(() => {
-    dispatch(fetchDeploymentTraces(filterValues));
-  }, [dispatch, filterValues]);
+  const {
+    data: deploymentTracesData,
+    isFetching,
+    fetchNextPage: fetchMoreDeploymentTraces,
+    refetch: refetchDeploymentTraces,
+    isSuccess,
+  } = useGetDeploymentTracesInfinite(filterValues);
+
+  const deploymentTracesList = useMemo(() => {
+    return deploymentTracesData?.pages.flatMap((item) => item.tracesList) || [];
+  }, [deploymentTracesData]);
+
+  const hasMore = useMemo(() => {
+    if (!deploymentTracesData || deploymentTracesData.pages.length === 0) {
+      return false;
+    }
+    const lastIndex = deploymentTracesData?.pages.length - 1;
+    return deploymentTracesData?.pages?.[lastIndex]?.hasMore || false;
+  }, [deploymentTracesData]);
+
+  const { dates, deploymentTracesMap } = useGroupedDeploymentTrace(
+    deploymentTracesList || []
+  );
 
   useEffect(() => {
-    if (inView && hasMore && isLoading === false) {
-      dispatch(fetchMoreDeploymentTraces(filterValues || {}));
+    if (inView && hasMore && isFetching === false) {
+      fetchMoreDeploymentTraces;
     }
-  }, [dispatch, inView, hasMore, isLoading, filterValues]);
+  }, [fetchMoreDeploymentTraces, hasMore, inView, isFetching]);
 
   const handleRefreshClick = (): void => {
-    dispatch(fetchDeploymentTraces(filterValues));
+    refetchDeploymentTraces();
   };
 
   const handleMoreClick = useCallback(() => {
-    dispatch(fetchMoreDeploymentTraces(filterValues || {}));
-  }, [dispatch, filterValues]);
+    // dispatch(fetchMoreDeploymentTraces(filterValues || {}));
+    fetchMoreDeploymentTraces();
+  }, [fetchMoreDeploymentTraces]);
 
   const handleFilterChange = (options: { commitHash?: string }): void => {
     navigate(
@@ -103,19 +95,28 @@ const DeploymentTracePage: FC = () => {
   }, [navigate]);
 
   return (
-    <Box display="flex" overflow="hidden" flex={1} flexDirection="column">
+    <Box
+      sx={{
+        display: "flex",
+        overflow: "hidden",
+        flex: 1,
+        flexDirection: "column",
+      }}
+    >
       <Toolbar variant="dense">
-        <Box flexGrow={1} />
+        <Box
+          sx={{
+            flexGrow: 1,
+          }}
+        />
         <Button
           color="primary"
           startIcon={<RefreshIcon />}
           onClick={handleRefreshClick}
-          disabled={isLoading}
+          disabled={isFetching}
         >
           {UI_TEXT_REFRESH}
-          {isLoading && (
-            <CircularProgress size={24} className={buttonClasses.progress} />
-          )}
+          {isFetching && <SpinnerIcon />}
         </Button>
         <Button
           color="primary"
@@ -125,26 +126,63 @@ const DeploymentTracePage: FC = () => {
           {openFilter ? UI_TEXT_HIDE_FILTER : UI_TEXT_FILTER}
         </Button>
       </Toolbar>
-
       <Divider />
-      <Box display="flex" overflow="hidden" flex={1}>
-        <ol className={classes.list} ref={listRef}>
-          {dates.length === 0 && isLoading && (
-            <Box display="flex" justifyContent="center" mt={3}>
+      <Box
+        sx={{
+          display: "flex",
+          overflow: "hidden",
+          flex: 1,
+        }}
+      >
+        <Box
+          component={"ol"}
+          sx={{
+            listStyle: "none",
+            padding: 3,
+            paddingTop: 0,
+            margin: 0,
+            flex: 1,
+            overflowY: "scroll",
+          }}
+          ref={listRef}
+        >
+          {dates.length === 0 && isFetching && (
+            <Box
+              sx={{
+                display: "flex",
+                justifyContent: "center",
+                mt: 3,
+              }}
+            >
               <CircularProgress />
             </Box>
           )}
-          {dates.length === 0 && !isLoading && (
-            <Box display="flex" justifyContent="center" mt={3}>
+          {dates.length === 0 && !isFetching && (
+            <Box
+              sx={{
+                display: "flex",
+                justifyContent: "center",
+                mt: 3,
+              }}
+            >
               <Typography>No deployments</Typography>
             </Box>
           )}
           {dates.map((date) => (
-            <Box key={date} mb={1}>
-              <Typography variant="subtitle1" className={classes.date}>
+            <Box
+              key={date}
+              sx={{
+                mb: 1,
+              }}
+            >
+              <Typography variant="subtitle1" sx={{ mt: 2, mb: 2 }}>
                 {date}
               </Typography>
-              <Box className={classes.listDeployment}>
+              <Box
+                sx={{
+                  bgcolor: "background.paper",
+                }}
+              >
                 {deploymentTracesMap[date].map(({ trace, deploymentsList }) => (
                   <DeploymentTraceItem
                     key={trace?.id}
@@ -155,7 +193,7 @@ const DeploymentTracePage: FC = () => {
               </Box>
             </Box>
           ))}
-          {status === "succeeded" && <div ref={ref} />}
+          {isSuccess && <div ref={ref} />}
           {!hasMore && (
             <Button
               color="primary"
@@ -163,18 +201,13 @@ const DeploymentTracePage: FC = () => {
               size="large"
               fullWidth
               onClick={handleMoreClick}
-              disabled={isLoading}
+              disabled={isFetching}
             >
               {UI_TEXT_MORE}
-              {isLoading && (
-                <CircularProgress
-                  size={24}
-                  className={buttonClasses.progress}
-                />
-              )}
+              {isFetching && <SpinnerIcon />}
             </Button>
           )}
-        </ol>
+        </Box>
 
         {openFilter && (
           <DeploymentTraceFilter

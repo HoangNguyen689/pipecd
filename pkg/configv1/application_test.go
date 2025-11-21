@@ -213,34 +213,6 @@ func TestFindSlackUsersAndGroups(t *testing.T) {
 	}
 }
 
-func TestValidateAnalysisTemplateRef(t *testing.T) {
-	testcases := []struct {
-		name    string
-		tplName string
-		wantErr bool
-	}{
-		{
-			name:    "valid",
-			tplName: "name",
-			wantErr: false,
-		},
-		{
-			name:    "invalid due to empty template name",
-			tplName: "",
-			wantErr: true,
-		},
-	}
-	for _, tc := range testcases {
-		t.Run(tc.name, func(t *testing.T) {
-			a := &AnalysisTemplateRef{
-				Name: tc.tplName,
-			}
-			err := a.Validate()
-			assert.Equal(t, tc.wantErr, err != nil)
-		})
-	}
-}
-
 func TestValidateEncryption(t *testing.T) {
 	testcases := []struct {
 		name             string
@@ -572,6 +544,7 @@ func TestGenericPostSyncConfiguration(t *testing.T) {
 		})
 	}
 }
+
 func TestGetStageConfigByte(t *testing.T) {
 	testcases := []struct {
 		name   string
@@ -580,13 +553,6 @@ func TestGetStageConfigByte(t *testing.T) {
 		want   []byte
 		wantOk bool
 	}{
-		{
-			name:   "pipeline not defined",
-			s:      GenericApplicationSpec{},
-			index:  0,
-			want:   nil,
-			wantOk: true,
-		},
 		{
 			name: "valid stage index",
 			s: GenericApplicationSpec{
@@ -615,7 +581,7 @@ func TestGetStageConfigByte(t *testing.T) {
 				},
 			},
 			index:  0,
-			want:   nil,
+			want:   []byte(`{}`),
 			wantOk: true,
 		},
 		{
@@ -640,6 +606,100 @@ func TestGetStageConfigByte(t *testing.T) {
 			got, ok := tc.s.GetStageConfigByte(tc.index)
 			assert.Equal(t, tc.wantOk, ok)
 			assert.Equal(t, string(tc.want), string(got))
+		})
+	}
+}
+
+func TestLoadApplication(t *testing.T) {
+	t.Parallel()
+
+	testcases := []struct {
+		name          string
+		repoPath      string
+		configRelPath string
+		want          *GenericApplicationSpec
+		wantErr       bool
+	}{
+		{
+			name:          "file not found",
+			repoPath:      "testdata",
+			configRelPath: "not-exist.yaml",
+			want:          nil,
+			wantErr:       true,
+		},
+		{
+			name:          "invalid kind",
+			repoPath:      "testdata",
+			configRelPath: "application/invalid-kind.yaml",
+			want:          nil,
+			wantErr:       true,
+		},
+		{
+			name:          "valid application config",
+			repoPath:      "testdata",
+			configRelPath: "application/generic-trigger.yaml",
+			want: &GenericApplicationSpec{
+				Timeout: Duration(6 * time.Hour),
+				Trigger: Trigger{
+					OnCommit: OnCommit{
+						Disabled: false,
+						Paths: []string{
+							"deployment.yaml",
+						},
+					},
+					OnOutOfSync: OnOutOfSync{
+						Disabled:  newBoolPointer(true),
+						MinWindow: Duration(5 * time.Minute),
+					},
+					OnChain: OnChain{
+						Disabled: newBoolPointer(true),
+					},
+				},
+				Planner: DeploymentPlanner{
+					AutoRollback: newBoolPointer(true),
+				},
+				Pipeline: &DeploymentPipeline{},
+			},
+			wantErr: false,
+		},
+		{
+			name:          "valid application config with plugins",
+			repoPath:      "testdata",
+			configRelPath: "application/plugins-config.yaml",
+			want: &GenericApplicationSpec{
+				Timeout: Duration(6 * time.Hour),
+				Trigger: Trigger{
+					OnOutOfSync: OnOutOfSync{
+						Disabled:  newBoolPointer(true),
+						MinWindow: Duration(5 * time.Minute),
+					},
+					OnChain: OnChain{
+						Disabled: newBoolPointer(true),
+					},
+				},
+				Planner: DeploymentPlanner{
+					AutoRollback: newBoolPointer(true),
+				},
+				Pipeline: &DeploymentPipeline{},
+				Plugins: map[string]struct{}{
+					"plugin-1": {},
+					"plugin-2": {},
+				},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := LoadApplication(tc.repoPath, tc.configRelPath)
+			if tc.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tc.want, got)
 		})
 	}
 }

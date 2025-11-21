@@ -4,15 +4,14 @@ import {
   CircularProgress,
   Divider,
   List,
-  makeStyles,
   Toolbar,
   Typography,
-} from "@material-ui/core";
-import CloseIcon from "@material-ui/icons/Close";
-import FilterIcon from "@material-ui/icons/FilterList";
-import RefreshIcon from "@material-ui/icons/Refresh";
+} from "@mui/material";
+import CloseIcon from "@mui/icons-material/Close";
+import FilterIcon from "@mui/icons-material/FilterList";
+import RefreshIcon from "@mui/icons-material/Refresh";
 import dayjs from "dayjs";
-import { FC, useCallback, useEffect, useRef, useState } from "react";
+import { FC, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useInView } from "react-intersection-observer";
 import { useNavigate } from "react-router-dom";
 import { PAGE_PATH_DEPLOYMENTS } from "~/constants/path";
@@ -22,21 +21,7 @@ import {
   UI_TEXT_REFRESH,
   UI_TEXT_MORE,
 } from "~/constants/ui-text";
-import {
-  useAppDispatch,
-  useAppSelector,
-  useShallowEqualSelector,
-} from "~/hooks/redux";
-import { fetchApplications } from "~/modules/applications";
-import {
-  Deployment,
-  DeploymentFilterOptions,
-  fetchDeployments,
-  fetchMoreDeployments,
-  selectById as selectDeploymentById,
-  selectIds as selectDeploymentIds,
-} from "~/modules/deployments";
-import { useStyles as useButtonStyles } from "~/styles/button";
+import { SpinnerIcon } from "~/styles/button";
 import {
   stringifySearchParams,
   useSearchParams,
@@ -44,59 +29,37 @@ import {
 } from "~/utils/search-params";
 import { DeploymentFilter } from "./deployment-filter";
 import { DeploymentItem } from "./deployment-item";
-
-const useStyles = makeStyles((theme) => ({
-  deploymentLists: {
-    listStyle: "none",
-    padding: theme.spacing(3),
-    paddingTop: 0,
-    margin: 0,
-    flex: 1,
-    overflowY: "scroll",
-  },
-  date: {
-    marginTop: theme.spacing(2),
-    marginBottom: theme.spacing(2),
-  },
-}));
+import {
+  DeploymentFilterOptions,
+  useGetDeploymentsInfinite,
+} from "~/queries/deployment/use-get-deployments-infinite";
+import { Deployment } from "~/types/deployment";
 
 const sortComp = (a: string | number, b: string | number): number => {
   return dayjs(b).valueOf() - dayjs(a).valueOf();
 };
 
-function filterUndefined<TValue>(value: TValue | undefined): value is TValue {
-  return value !== undefined;
-}
+const useGroupedDeployments = (
+  deployments: Deployment.AsObject[]
+): Record<string, Deployment.AsObject[]> => {
+  return useMemo(() => {
+    const result: Record<string, Deployment.AsObject[]> = {};
 
-const useGroupedDeployments = (): Record<string, Deployment.AsObject[]> => {
-  const deployments = useShallowEqualSelector<Deployment.AsObject[]>((state) =>
-    selectDeploymentIds(state.deployments)
-      .map((id) => selectDeploymentById(state.deployments, id))
-      .filter(filterUndefined)
-  );
+    deployments.forEach((deployment) => {
+      const dateStr = dayjs(deployment.createdAt * 1000).format("YYYY/MM/DD");
+      if (!result[dateStr]) {
+        result[dateStr] = [];
+      }
+      result[dateStr].push(deployment);
+    });
 
-  const result: Record<string, Deployment.AsObject[]> = {};
-
-  deployments.forEach((deployment) => {
-    const dateStr = dayjs(deployment.createdAt * 1000).format("YYYY/MM/DD");
-    if (!result[dateStr]) {
-      result[dateStr] = [];
-    }
-    result[dateStr].push(deployment);
-  });
-
-  return result;
+    return result;
+  }, [deployments]);
 };
 
 export const DeploymentIndexPage: FC = () => {
-  const classes = useStyles();
-  const buttonClasses = useButtonStyles();
   const navigate = useNavigate();
-  const dispatch = useAppDispatch();
   const listRef = useRef(null);
-  const status = useAppSelector((state) => state.deployments.status);
-  const hasMore = useAppSelector((state) => state.deployments.hasMore);
-  const groupedDeployments = useGroupedDeployments();
   const filterOptions = useSearchParams();
   const [openFilter, setOpenFilter] = useState(true);
   const [ref, inView] = useInView({
@@ -104,21 +67,33 @@ export const DeploymentIndexPage: FC = () => {
     root: listRef.current,
   });
 
-  const isLoading = status === "loading";
+  const {
+    data: deploymentsData,
+    isFetching,
+    fetchNextPage: fetchMoreDeployments,
+    refetch: refreshDeployments,
+    isSuccess,
+  } = useGetDeploymentsInfinite(filterOptions);
 
-  useEffect(() => {
-    dispatch(fetchApplications());
-  }, [dispatch]);
+  const deploymentsList = useMemo(() => {
+    return deploymentsData?.pages.flatMap((item) => item.deploymentsList) || [];
+  }, [deploymentsData]);
 
-  useEffect(() => {
-    dispatch(fetchDeployments(filterOptions));
-  }, [dispatch, filterOptions]);
-
-  useEffect(() => {
-    if (inView && hasMore && isLoading === false) {
-      dispatch(fetchMoreDeployments(filterOptions));
+  const hasMore = useMemo(() => {
+    if (!deploymentsData || deploymentsData.pages.length === 0) {
+      return false;
     }
-  }, [dispatch, inView, hasMore, isLoading, filterOptions]);
+    const lastIndex = deploymentsData?.pages.length - 1;
+    return deploymentsData?.pages?.[lastIndex]?.hasMore || false;
+  }, [deploymentsData]);
+
+  const groupedDeployments = useGroupedDeployments(deploymentsList || []);
+
+  useEffect(() => {
+    if (inView && hasMore && isFetching === false) {
+      fetchMoreDeployments();
+    }
+  }, [inView, isFetching, filterOptions, fetchMoreDeployments, hasMore]);
 
   // filter handlers
   const handleFilterChange = useCallback(
@@ -138,29 +113,38 @@ export const DeploymentIndexPage: FC = () => {
   }, [navigate]);
 
   const handleRefreshClick = useCallback(() => {
-    dispatch(fetchDeployments(filterOptions));
-  }, [dispatch, filterOptions]);
+    refreshDeployments();
+  }, [refreshDeployments]);
 
   const handleMoreClick = useCallback(() => {
-    dispatch(fetchMoreDeployments(filterOptions));
-  }, [dispatch, filterOptions]);
+    fetchMoreDeployments();
+  }, [fetchMoreDeployments]);
 
   const dates = Object.keys(groupedDeployments).sort(sortComp);
 
   return (
-    <Box display="flex" overflow="hidden" flex={1} flexDirection="column">
+    <Box
+      sx={{
+        display: "flex",
+        overflow: "hidden",
+        flex: 1,
+        flexDirection: "column",
+      }}
+    >
       <Toolbar variant="dense">
-        <Box flexGrow={1} />
+        <Box
+          sx={{
+            flexGrow: 1,
+          }}
+        />
         <Button
           color="primary"
           startIcon={<RefreshIcon />}
           onClick={handleRefreshClick}
-          disabled={isLoading}
+          disabled={isFetching}
         >
           {UI_TEXT_REFRESH}
-          {isLoading && (
-            <CircularProgress size={24} className={buttonClasses.progress} />
-          )}
+          {isFetching && <SpinnerIcon />}
         </Button>
         <Button
           color="primary"
@@ -170,23 +154,51 @@ export const DeploymentIndexPage: FC = () => {
           {openFilter ? UI_TEXT_HIDE_FILTER : UI_TEXT_FILTER}
         </Button>
       </Toolbar>
-
       <Divider />
-      <Box display="flex" overflow="hidden" flex={1}>
-        <ol className={classes.deploymentLists} ref={listRef}>
+      <Box
+        sx={{
+          display: "flex",
+          overflow: "hidden",
+          flex: 1,
+        }}
+      >
+        <Box
+          component={"ol"}
+          sx={(theme) => ({
+            listStyle: "none",
+            padding: theme.spacing(3),
+            paddingTop: 0,
+            margin: 0,
+            flex: 1,
+            overflowY: "scroll",
+          })}
+          ref={listRef}
+        >
           {dates.length === 0 &&
-            (isLoading ? (
-              <Box display="flex" justifyContent="center" mt={3}>
+            (isFetching ? (
+              <Box
+                sx={{
+                  display: "flex",
+                  justifyContent: "center",
+                  mt: 3,
+                }}
+              >
                 <CircularProgress />
               </Box>
             ) : (
-              <Box display="flex" justifyContent="center" mt={3}>
+              <Box
+                sx={{
+                  display: "flex",
+                  justifyContent: "center",
+                  mt: 3,
+                }}
+              >
                 <Typography>No deployments</Typography>
               </Box>
             ))}
           {dates.map((date) => (
             <li key={date}>
-              <Typography variant="subtitle1" className={classes.date}>
+              <Typography variant="subtitle1" sx={{ mt: 2, mb: 2 }}>
                 {date}
               </Typography>
               <List>
@@ -194,34 +206,30 @@ export const DeploymentIndexPage: FC = () => {
                   .sort((a, b) => sortComp(a.createdAt, b.createdAt))
                   .map((deployment) => (
                     <DeploymentItem
-                      id={deployment.id}
-                      key={`deployment-item-${deployment.id}`}
+                      key={deployment.id}
+                      deployment={deployment}
                     />
                   ))}
               </List>
             </li>
           ))}
-          {status === "succeeded" && <div ref={ref} />}
-          {!hasMore && (
+          {isSuccess && <div ref={ref} />}
+          {!deploymentsData?.pages?.[deploymentsData.pages.length - 1]
+            ?.hasMore && (
             <Button
               color="primary"
               variant="outlined"
               size="large"
               fullWidth
               onClick={handleMoreClick}
-              disabled={isLoading}
+              disabled={isFetching}
             >
               {UI_TEXT_MORE}
-              {isLoading && (
-                <CircularProgress
-                  size={24}
-                  className={buttonClasses.progress}
-                />
-              )}
+              {isFetching && <SpinnerIcon />}
             </Button>
           )}
           {/* TODO: Show how many days have been read */}
-        </ol>
+        </Box>
         {openFilter && (
           <DeploymentFilter
             options={filterOptions}

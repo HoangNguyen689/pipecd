@@ -1,48 +1,35 @@
 import {
   FormControl,
   InputLabel,
-  makeStyles,
   MenuItem,
   Select,
   TextField,
-} from "@material-ui/core";
-import Autocomplete from "@material-ui/lab/Autocomplete";
+} from "@mui/material";
+import Autocomplete from "@mui/material/Autocomplete";
 import { FC, memo, useCallback, useState, useEffect } from "react";
 import { FilterView } from "~/components/filter-view";
 import { EVENT_STATE_TEXT } from "~/constants/event-status-text";
-import { useAppSelector } from "~/hooks/redux";
+import { Event, EventStatus } from "pipecd/web/model/event_pb";
 import {
-  Event,
   EventFilterOptions,
-  EventStatus,
   EventStatusKey,
-  selectAll as selectAllEvents,
-} from "~/modules/events";
-
-const useStyles = makeStyles((theme) => ({
-  formItem: {
-    width: "100%",
-    marginTop: theme.spacing(4),
-  },
-  select: {
-    width: "100%",
-  },
-}));
+} from "~/queries/events/use-get-events-infinite";
 
 const ALL_VALUE = "ALL";
 
 export interface EventFilterProps {
+  events: Event.AsObject[];
   options: EventFilterOptions;
   onClear: () => void;
   onChange: (options: EventFilterOptions) => void;
 }
 
 export const EventFilter: FC<EventFilterProps> = memo(function EventFilter({
+  events,
   options,
   onChange,
   onClear,
 }) {
-  const classes = useStyles();
   const handleUpdateFilterValue = useCallback(
     (opts: Partial<EventFilterOptions>): void => {
       onChange({ ...options, ...opts });
@@ -50,11 +37,8 @@ export const EventFilter: FC<EventFilterProps> = memo(function EventFilter({
     [options, onChange]
   );
 
-  const events = useAppSelector<Event.AsObject[]>((state) =>
-    selectAllEvents(state.events)
-  );
-
   const [allNames, setAllNames] = useState(new Array<string>());
+
   useEffect(() => {
     const names = new Set<string>();
     events.map((event) => {
@@ -65,15 +49,17 @@ export const EventFilter: FC<EventFilterProps> = memo(function EventFilter({
 
   const [allLabels, setAllLabels] = useState(new Array<string>());
   const [selectedLabels, setSelectedLabels] = useState(new Array<string>());
+
   useEffect(() => {
     const labels = new Set<string>();
     events
       .filter((app) => app.labelsMap.length > 0)
-      .map((app) => {
-        app.labelsMap.map((label) => {
+      .forEach((app) => {
+        app.labelsMap.forEach((label) => {
           labels.add(`${label[0]}:${label[1]}`);
         });
       });
+
     setAllLabels(Array.from(labels));
   }, [events]);
 
@@ -81,16 +67,15 @@ export const EventFilter: FC<EventFilterProps> = memo(function EventFilter({
     <FilterView
       onClear={() => {
         onClear();
-        setSelectedLabels([]);
       }}
     >
-      <FormControl className={classes.formItem} variant="outlined">
+      <FormControl sx={{ width: "100%", mt: 4 }} variant="outlined">
         <Autocomplete
           autoHighlight
           id="filter-event-name"
           noOptionsText="No selectable name"
           options={allNames}
-          value={options.name}
+          value={options.name ?? ""}
           onInputChange={(_, value) => {
             setAllNames([value]);
           }}
@@ -112,14 +97,14 @@ export const EventFilter: FC<EventFilterProps> = memo(function EventFilter({
         />
       </FormControl>
 
-      <FormControl className={classes.formItem} variant="outlined">
+      <FormControl sx={{ width: "100%", mt: 4 }} variant="outlined">
         <InputLabel id="filter-event-status">Event Status</InputLabel>
         <Select
           labelId="filter-event-status"
           id="filter-event-status"
           value={options.status ?? ALL_VALUE}
           label="Event Status"
-          className={classes.select}
+          fullWidth
           onChange={(e) => {
             handleUpdateFilterValue({
               status:
@@ -142,7 +127,7 @@ export const EventFilter: FC<EventFilterProps> = memo(function EventFilter({
         </Select>
       </FormControl>
 
-      <FormControl className={classes.formItem} variant="outlined">
+      <FormControl sx={{ width: "100%", mt: 4 }} variant="outlined">
         <Autocomplete
           multiple
           autoHighlight

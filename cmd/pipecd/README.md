@@ -26,10 +26,10 @@ For the full list of available commands, please see the Makefile at the root of 
 1. Start running a Kubernetes cluster (If you don't have any Kubernetes cluster to use)
 
     ``` console
-    make kind-up
+    make up/local-cluster
     ```
 
-    Once it is no longer used, run `make kind-down` to delete it.
+    Once it is no longer used, run `make down/local-cluster` to delete it.
 
 2. Install the web dependencies module
 
@@ -55,3 +55,7 @@ For the full list of available commands, please see the Makefile at the root of 
 
 ## How to run Piped locally and add an application to your cluster
 See [How to run Piped agent locally](https://github.com/pipe-cd/pipecd/tree/master/cmd/piped#how-to-run-piped-agent-locally).
+
+## How to set up OIDC provider(Keycloak) locally
+
+Run `make setup-local-oidc` to set up local OIDC provider(keycloak). This will create a new Keycloak realm and an OIDC client for PipeCD. See [Local Keycloak](../../hack/oidc/README.md) for more details.

@@ -63,6 +63,7 @@ import (
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/livestatereporter"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/metadatastore"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/notifier"
+	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/planpreview"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/statsreporter"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/trigger"
@@ -116,7 +117,7 @@ func NewCommand() *cobra.Command {
 		maxRecvMsgSize:    1024 * 1024 * 10, // 10MB
 	}
 	cmd := &cobra.Command{
-		Use:   "piped",
+		Use:   "run",
 		Short: "Start running piped.",
 		RunE:  cli.WithContext(p.run),
 	}
@@ -125,6 +126,10 @@ func NewCommand() *cobra.Command {
 	cmd.Flags().StringVar(&p.configData, "config-data", p.configData, "The base64 encoded string of the configuration data.")
 	cmd.Flags().StringVar(&p.configGCPSecret, "config-gcp-secret", p.configGCPSecret, "The resource ID of secret that contains Piped config and be stored in GCP SecretManager.")
 	cmd.Flags().StringVar(&p.configAWSSecret, "config-aws-secret", p.configAWSSecret, "The ARN of secret that contains Piped config and be stored in AWS Secrets Manager.")
+
+	configFlags := []string{"config-file", "config-data", "config-gcp-secret", "config-aws-secret"}
+	cmd.MarkFlagsMutuallyExclusive(configFlags...)
+	cmd.MarkFlagsOneRequired(configFlags...)
 
 	cmd.Flags().BoolVar(&p.insecure, "insecure", p.insecure, "Whether disabling transport security while connecting to control-plane.")
 	cmd.Flags().StringVar(&p.certFile, "cert-file", p.certFile, "The path to the TLS certificate file.")
@@ -162,14 +167,16 @@ func (p *piped) run(ctx context.Context, input cli.Input) (runErr error) {
 	// Register all metrics.
 	registry := registerMetrics(cfg.PipedID, cfg.ProjectID, p.launcherVersion)
 
-	// // Configure SSH config if needed.
-	// if cfg.Git.ShouldConfigureSSHConfig() {
-	// 	if err := git.AddSSHConfig(cfg.Git); err != nil {
-	// 		input.Logger.Error("failed to configure ssh-config", zap.Error(err))
-	// 		return err
-	// 	}
-	// 	input.Logger.Info("successfully configured ssh-config")
-	// }
+	// Configure SSH config if needed.
+	if cfg.Git.ShouldConfigureSSHConfig() {
+		tempFile, err := git.AddSSHConfig(cfg.Git)
+		if err != nil {
+			input.Logger.Error("failed to configure ssh-config", zap.Error(err))
+			return err
+		}
+		defer os.Remove(tempFile)
+		input.Logger.Info("successfully configured ssh-config")
+	}
 
 	pipedKey, err := cfg.LoadPipedKey()
 	if err != nil {
@@ -281,12 +288,14 @@ func (p *piped) run(ctx context.Context, input cli.Input) (runErr error) {
 
 	// Start running command store.
 	var commandLister commandstore.Lister
+	var commandReporter commandstore.Reporter
 	{
 		store := commandstore.NewStore(apiClient, p.gracePeriod, input.Logger)
 		group.Go(func() error {
 			return store.Run(ctx)
 		})
 		commandLister = store.Lister()
+		commandReporter = store.Reporter()
 	}
 
 	// Start running event store.
@@ -356,7 +365,7 @@ func (p *piped) run(ctx context.Context, input cli.Input) (runErr error) {
 		rpcclient.WithInsecure(),
 	}
 	for _, plg := range cfg.Plugins {
-		cli, err := pluginapi.NewClient(ctx, net.JoinHostPort("localhost", strconv.Itoa(plg.Port)), options...)
+		cli, err := pluginapi.NewClient(ctx, plg.Name, net.JoinHostPort("localhost", strconv.Itoa(plg.Port)), options...)
 		if err != nil {
 			input.Logger.Error("failed to create client to connect plugin", zap.String("plugin", plg.Name), zap.Error(err))
 			return err
@@ -400,6 +409,7 @@ func (p *piped) run(ctx context.Context, input cli.Input) (runErr error) {
 			pluginRegistry,
 			deploymentLister,
 			commandLister,
+			commandReporter,
 			notifier,
 			decrypter,
 			*metadataStoreRegistry,
@@ -414,6 +424,7 @@ func (p *piped) run(ctx context.Context, input cli.Input) (runErr error) {
 	}
 
 	// Start running deployment trigger.
+	var lastTriggeredCommitGetter trigger.LastTriggeredCommitGetter
 	{
 		tr, err := trigger.NewTrigger(
 			apiClient,
@@ -429,6 +440,7 @@ func (p *piped) run(ctx context.Context, input cli.Input) (runErr error) {
 			input.Logger.Error("failed to initialize trigger", zap.Error(err))
 			return err
 		}
+		lastTriggeredCommitGetter = tr.GetLastTriggeredCommitGetter()
 
 		group.Go(func() error {
 			return tr.Run(ctx)
@@ -451,7 +463,46 @@ func (p *piped) run(ctx context.Context, input cli.Input) (runErr error) {
 
 	// Start running planpreview handler.
 	{
-		// TODO: Implement planpreview controller.
+		// Decode password for plan-preview feature.
+		password, err := cfg.Git.DecodedPassword()
+		if err != nil {
+			input.Logger.Error("failed to decode password", zap.Error(err))
+			return err
+		}
+		// Initialize a dedicated git client for plan-preview feature.
+		// Basically, this feature is an utility so it should not share any resource with the main components of piped.
+		gc, err := git.NewClient(
+			git.WithUserName(cfg.Git.Username),
+			git.WithEmail(cfg.Git.Email),
+			git.WithLogger(input.Logger),
+			git.WithPassword(password),
+		)
+		if err != nil {
+			input.Logger.Error("failed to initialize git client for plan-preview", zap.Error(err))
+			return err
+		}
+		defer func() {
+			if err := gc.Clean(); err != nil {
+				input.Logger.Error("had an error while cleaning gitClient for plan-preview", zap.Error(err))
+				return
+			}
+			input.Logger.Info("successfully cleaned gitClient for plan-preview")
+		}()
+
+		h := planpreview.NewHandler(
+			gc,
+			apiClient,
+			commandLister,
+			applicationLister,
+			lastTriggeredCommitGetter,
+			decrypter,
+			cfg,
+			pluginRegistry,
+			planpreview.WithLogger(input.Logger),
+		)
+		group.Go(func() error {
+			return h.Run(ctx)
+		})
 	}
 
 	// Start running app-config-reporter.
@@ -598,10 +649,11 @@ func (p *piped) createTracerProvider(ctx context.Context, address, projectID, pi
 
 // loadConfig reads the Piped configuration data from the specified source.
 func (p *piped) loadConfig(ctx context.Context) (*config.PipedSpec, error) {
-	// HACK: When the version of cobra is updated to >=v1.8.0, this should be replaced with https://pkg.go.dev/github.com/spf13/cobra#Command.MarkFlagsMutuallyExclusive.
-	if err := p.hasTooManyConfigFlags(); err != nil {
-		return nil, err
-	}
+	var (
+		cfg  *config.Config[*config.PipedSpec, config.PipedSpec]
+		err  error
+		data []byte
+	)
 
 	extract := func(cfg *config.Config[*config.PipedSpec, config.PipedSpec]) (*config.PipedSpec, error) {
 		if cfg.Kind != config.KindPiped {
@@ -610,52 +662,35 @@ func (p *piped) loadConfig(ctx context.Context) (*config.PipedSpec, error) {
 		return cfg.Spec, nil
 	}
 
-	if p.configFile != "" {
-		cfg, err := config.LoadFromYAML[*config.PipedSpec](p.configFile)
-		if err != nil {
-			return nil, err
-		}
-		return extract(cfg)
-	}
-
-	if p.configData != "" {
-		data, err := base64.StdEncoding.DecodeString(p.configData)
+	switch {
+	case p.configFile != "":
+		cfg, err = config.LoadFromYAML[*config.PipedSpec](p.configFile)
+	case p.configData != "":
+		data, err = base64.StdEncoding.DecodeString(p.configData)
 		if err != nil {
 			return nil, fmt.Errorf("the given config-data isn't base64 encoded: %w", err)
 		}
-
-		cfg, err := config.DecodeYAML[*config.PipedSpec](data)
-		if err != nil {
-			return nil, err
-		}
-		return extract(cfg)
-	}
-
-	if p.configGCPSecret != "" {
-		data, err := p.getConfigDataFromSecretManager(ctx)
+		cfg, err = config.DecodeYAML[*config.PipedSpec](data)
+	case p.configGCPSecret != "":
+		data, err = p.getConfigDataFromSecretManager(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load config from SecretManager (%w)", err)
 		}
-		cfg, err := config.DecodeYAML[*config.PipedSpec](data)
-		if err != nil {
-			return nil, err
-		}
-		return extract(cfg)
-	}
-
-	if p.configAWSSecret != "" {
-		data, err := p.getConfigDataFromAWSSecretsManager(ctx)
+		cfg, err = config.DecodeYAML[*config.PipedSpec](data)
+	case p.configAWSSecret != "":
+		data, err = p.getConfigDataFromAWSSecretsManager(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load config from AWS Secrets Manager (%w)", err)
 		}
-		cfg, err := config.DecodeYAML[*config.PipedSpec](data)
-		if err != nil {
-			return nil, err
-		}
-		return extract(cfg)
+		cfg, err = config.DecodeYAML[*config.PipedSpec](data)
+	default:
+		return nil, fmt.Errorf("one of config-file, config-data, config-gcp-secret or config-aws-secret must be set")
 	}
 
-	return nil, fmt.Errorf("one of config-file, config-gcp-secret or config-aws-secret must be set")
+	if err != nil {
+		return nil, err
+	}
+	return extract(cfg)
 }
 
 func (p *piped) runPlugins(ctx context.Context, pluginsCfg []config.PipedPlugin, logger *zap.Logger) ([]*lifecycle.Command, error) {
@@ -933,17 +968,4 @@ func stopCommandHandler(ctx context.Context, cmdLister commandstore.Lister, logg
 	}
 
 	return true, nil
-}
-
-func (p *piped) hasTooManyConfigFlags() error {
-	cnt := 0
-	for _, v := range []string{p.configFile, p.configGCPSecret, p.configAWSSecret} {
-		if v != "" {
-			cnt++
-		}
-	}
-	if cnt > 1 {
-		return fmt.Errorf("only one of config-file, config-gcp-secret or config-aws-secret could be set")
-	}
-	return nil
 }

@@ -134,9 +134,8 @@ func (s *ops) run(ctx context.Context, input cli.Input) error {
 		})
 	}
 
-	dbCache := rediscache.NewTTLCache(rd, 3*time.Hour)
 	// Connect to the data store.
-	ds, err := createDatastore(ctx, cfg, fs, dbCache, input.Logger)
+	ds, err := createDatastore(ctx, cfg, input.Logger)
 	if err != nil {
 		input.Logger.Error("failed to create datastore", zap.Error(err))
 		return err
@@ -204,14 +203,14 @@ func (s *ops) run(ctx context.Context, input cli.Input) error {
 
 	insightMetricsCollector := insightmetrics.NewInsightMetricsCollector(
 		insight.NewProvider(insightStore),
-		datastore.NewProjectStore(ds, datastore.OpsCommander),
+		datastore.NewProjectStore(ds),
 	)
 
 	// Start running HTTP server.
 	{
 		handler := handler.NewHandler(
 			s.httpPort,
-			datastore.NewProjectStore(ds, datastore.OpsCommander),
+			datastore.NewProjectStore(ds),
 			cfg.SharedSSOConfigs,
 			s.gracePeriod,
 			input.Logger,

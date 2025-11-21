@@ -27,6 +27,8 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/deploysource"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin"
@@ -227,9 +229,15 @@ func (r *reporter) flush(ctx context.Context, app *model.Application, repo git.R
 			ApplicationId:   app.GetId(),
 			ApplicationName: app.GetName(),
 			DeploySource:    ds.ToPluginDeploySource(),
-			DeployTargets:   app.GetDeployTargets(),
+			DeployTargets:   app.GetDeployTargetsByPluginName(pluginClient.Name()),
 		})
 		if err != nil {
+			st, ok := status.FromError(err)
+			if ok && st.Code() == codes.Unimplemented {
+				r.logger.Info(fmt.Sprintf("plugin '%s' does not support livestate feature", pluginClient.Name()))
+				continue
+			}
+
 			r.logger.Info(fmt.Sprintf("no app state of application %s to report", app.Id))
 			return err
 		}
@@ -243,7 +251,8 @@ func (r *reporter) flush(ctx context.Context, app *model.Application, repo git.R
 		ApplicationId: app.Id,
 		PipedId:       app.PipedId,
 		ProjectId:     app.ProjectId,
-		Kind:          app.Kind,
+		// TODO: Remove this field when we find a way to implement StateView component for application state.
+		Kind: app.Kind,
 		ApplicationLiveState: &model.ApplicationLiveState{
 			Resources: resourceStates,
 		},

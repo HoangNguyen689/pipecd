@@ -45,7 +45,7 @@ type ECS interface {
 	ListClusters(ctx context.Context) ([]string, error)
 	ServiceExists(ctx context.Context, clusterName string, servicesName string) (bool, error)
 	CreateService(ctx context.Context, service types.Service) (*types.Service, error)
-	UpdateService(ctx context.Context, service types.Service) (*types.Service, error)
+	UpdateService(ctx context.Context, service types.Service, forceNewDeployment bool) (*types.Service, error)
 	PruneServiceTasks(ctx context.Context, service types.Service) error
 	WaitServiceStable(ctx context.Context, service types.Service) error
 	GetServices(ctx context.Context, clusterName string) ([]*types.Service, error)
@@ -58,13 +58,16 @@ type ECS interface {
 	DeleteTaskSet(ctx context.Context, taskSet types.TaskSet) error
 	UpdateServicePrimaryTaskSet(ctx context.Context, service types.Service, taskSet types.TaskSet) (*types.TaskSet, error)
 	TagResource(ctx context.Context, resourceArn string, tags []types.Tag) error
+	ListTags(ctx context.Context, resourceArn string) ([]types.Tag, error)
+	UntagResource(ctx context.Context, resourceArn string, tagKeys []string) error
 }
 
 type ELB interface {
 	GetListenerArns(ctx context.Context, targetGroup types.LoadBalancer) ([]string, error)
 	// ModifyListeners modifies the actions of type ActionTypeEnumForward to perform routing traffic
 	// to the given target groups. Other actions won't be modified.
-	ModifyListeners(ctx context.Context, listenerArns []string, routingTrafficCfg RoutingTrafficConfig) error
+	// Note: This method will return any successfully modified rule ARNs even when returning an error.
+	ModifyListeners(ctx context.Context, listenerArns []string, routingTrafficCfg RoutingTrafficConfig) (modifiedRuleArns []string, err error)
 }
 
 // Registry holds a pool of aws client wrappers.
@@ -134,4 +137,9 @@ func MakeTags(tags map[string]string) []types.Tag {
 		resourceTags = append(resourceTags, types.Tag{Key: aws.String(key), Value: aws.String(value)})
 	}
 	return resourceTags
+}
+
+// IsPipeCDManagedTag checks if the given tag key is managed by PipeCD.
+func IsPipeCDManagedTag(key string) bool {
+	return key == LabelManagedBy || key == LabelPiped || key == LabelApplication || key == LabelCommitHash
 }

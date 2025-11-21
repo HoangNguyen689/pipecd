@@ -1,68 +1,118 @@
-import { Box, makeStyles } from "@material-ui/core";
-import { FC, memo, useEffect } from "react";
+import { Box } from "@mui/material";
+import { FC, memo, useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
-import { useAppDispatch, useAppSelector } from "~/hooks/redux";
-import { useInterval } from "~/hooks/use-interval";
-import { clearActiveStage } from "~/modules/active-stage";
-import {
-  Deployment,
-  fetchDeploymentById,
-  isDeploymentRunning,
-  selectById as selectDeploymentById,
-} from "~/modules/deployments";
 import { DeploymentDetail } from "./deployment-detail";
 import { LogViewer } from "./log-viewer";
 import { Pipeline } from "./pipeline";
+import { Deployment } from "pipecd/web/model/deployment_pb";
+import { useGetDeploymentById } from "~/queries/deployment/use-get-deployment-by-id";
+import { useGetStageLogs } from "~/queries/stage-logs/use-get-stage-logs";
+import { isDeploymentRunning } from "~/utils/is-deployment-running";
+import { findDefaultActiveStageInDeployment } from "~/utils/find-default-active-stage-in-deployment";
 
-const FETCH_INTERVAL = 4000;
+const DEPLOYMENT_FETCH_INTERVAL = 4000;
+const LOG_FETCH_INTERVAL = 2000;
 
-const useStyles = makeStyles({
-  root: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "stretch",
-    flex: 1,
-    overflow: "auto",
-  },
-});
+export type ActiveStageInfo = {
+  stageId: string;
+  deploymentId: string;
+  name: string;
+} | null;
 
 export const DeploymentDetailPage: FC = memo(function DeploymentDetailPage() {
-  const classes = useStyles();
-  const dispatch = useAppDispatch();
+  const [activeStageInfo, setActiveStageInfo] = useState<ActiveStageInfo>(null);
   const { deploymentId } = useParams<{ deploymentId: string }>();
-  const deployment = useAppSelector<Deployment.AsObject | undefined>((state) =>
-    selectDeploymentById(state.deployments, deploymentId ?? "")
-  );
 
-  const fetchData = (): void => {
-    if (deploymentId) {
-      dispatch(fetchDeploymentById(deploymentId));
+  const { data: deployment } = useGetDeploymentById(
+    { deploymentId: deploymentId ?? "" },
+    {
+      enabled: !!deploymentId,
+      refetchInterval: (data) => {
+        return isDeploymentRunning(data?.status)
+          ? DEPLOYMENT_FETCH_INTERVAL
+          : false;
+      },
     }
-  };
-
-  useEffect(fetchData, [dispatch, deploymentId]);
-  useInterval(
-    fetchData,
-    deploymentId && isDeploymentRunning(deployment?.status)
-      ? FETCH_INTERVAL
-      : null
   );
+
+  const { data: stageLogs } = useGetStageLogs(
+    {
+      deployment: deployment ?? ({} as Deployment.AsObject),
+      offsetIndex: 0,
+      retriedCount: 0,
+      stageId: activeStageInfo?.stageId ?? "",
+    },
+    {
+      refetchInterval: () => {
+        return !!activeStageInfo && isDeploymentRunning(deployment?.status)
+          ? LOG_FETCH_INTERVAL
+          : false;
+      },
+      enabled: !!deployment && !!activeStageInfo?.stageId,
+      placeholderData: {
+        stageId: activeStageInfo?.stageId ?? "",
+        deploymentId: deployment?.id ?? "",
+        logBlocks: [],
+      },
+    }
+  );
+
+  useEffect(() => {
+    const defaultActiveStage = findDefaultActiveStageInDeployment(deployment);
+    if (defaultActiveStage && deployment) {
+      setActiveStageInfo({
+        deploymentId: deployment.id ?? "",
+        stageId: defaultActiveStage.id,
+        name: defaultActiveStage.name,
+      });
+    }
+  }, [deployment]);
 
   // NOTE: Clear active stage when leave detail page
   useEffect(
     () => () => {
-      dispatch(clearActiveStage());
+      setActiveStageInfo(null);
     },
-    [dispatch]
+    []
   );
 
+  const activeStage = useMemo(() => {
+    return (
+      deployment?.stagesList.find((s) => s.id === activeStageInfo?.stageId) ??
+      null
+    );
+  }, [deployment, activeStageInfo]);
+
   return (
-    <div className={classes.root}>
-      <Box flex={1}>
-        <DeploymentDetail deploymentId={deploymentId ?? ""} />
-        <Pipeline deploymentId={deploymentId ?? ""} />
+    <Box
+      sx={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "stretch",
+        flex: 1,
+        overflow: "auto",
+      }}
+    >
+      <Box
+        sx={{
+          flex: 1,
+        }}
+      >
+        <DeploymentDetail
+          deploymentId={deploymentId ?? ""}
+          deployment={deployment}
+        />
+        <Pipeline
+          deployment={deployment}
+          activeStageInfo={activeStageInfo}
+          changeActiveStage={setActiveStageInfo}
+        />
       </Box>
-      <LogViewer />
-    </div>
+      <LogViewer
+        stageLog={stageLogs}
+        changeActiveStage={setActiveStageInfo}
+        activeStage={activeStage}
+      />
+    </Box>
   );
 });

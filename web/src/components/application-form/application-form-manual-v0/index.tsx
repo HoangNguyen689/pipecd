@@ -1,26 +1,20 @@
-import {
-  Box,
-  Button,
-  CircularProgress,
-  Divider,
-  makeStyles,
-  TextField,
-  Typography,
-} from "@material-ui/core";
-import { FC, useEffect } from "react";
+import { Box, Button, Divider, TextField, Typography } from "@mui/material";
+import { FC, useEffect, useMemo } from "react";
 import { APPLICATION_KIND_TEXT } from "~/constants/application-kind";
 import { UI_TEXT_CANCEL, UI_TEXT_SAVE } from "~/constants/ui-text";
-import { ApplicationKind } from "~/modules/applications";
-import { Piped, selectAllPipeds, selectPipedById } from "~/modules/pipeds";
 import { sortFunc } from "~/utils/common";
 import { ApplicationFormProps } from "..";
 import { useFormik } from "formik";
 import * as yup from "yup";
 
-import { unwrapResult, useAppDispatch, useAppSelector } from "~/hooks/redux";
-import { addApplication } from "~/modules/applications";
 import FormSelectInput from "../../form-select-input";
-import { updateApplication } from "~/modules/update-application";
+import { GroupTwoCol, StyledForm } from "../styles";
+import { SpinnerIcon } from "~/styles/button";
+import { useAddApplication } from "~/queries/applications/use-add-application";
+import { useUpdateApplication } from "~/queries/applications/use-update-application";
+import { useGetPipeds } from "~/queries/pipeds/use-get-pipeds";
+import { Piped } from "~~/model/piped_pb";
+import { ApplicationKind } from "~/types/applications";
 
 type FormValues = {
   name: string;
@@ -98,33 +92,6 @@ const createRepoListFromPiped = (
   }));
 };
 
-const useStyles = makeStyles((theme) => ({
-  title: {
-    padding: theme.spacing(2),
-  },
-  form: {
-    padding: theme.spacing(2),
-    display: "grid",
-    gap: theme.spacing(2),
-  },
-  textInput: {
-    flex: 1,
-  },
-  inputGroup: {
-    display: "grid",
-    gridTemplateColumns: "1fr 1fr",
-    gap: theme.spacing(3),
-  },
-  buttonProgress: {
-    color: theme.palette.primary.main,
-    position: "absolute",
-    top: "50%",
-    left: "50%",
-    marginTop: -12,
-    marginLeft: -12,
-  },
-}));
-
 const validationSchema = yup.object().shape({
   name: yup.string().required(),
   kind: yup.number().required(),
@@ -147,9 +114,11 @@ const ApplicationFormManualV0: FC<ApplicationFormProps> = ({
   onFinished,
   setIsFormDirty,
   setIsSubmitting,
-  detailApp: detailApp,
+  detailApp,
 }) => {
-  const dispatch = useAppDispatch();
+  const { mutate: addApplication } = useAddApplication();
+  const { mutate: updateApplication } = useUpdateApplication();
+
   const formik = useFormik<FormValues>({
     initialValues: detailApp
       ? {
@@ -171,25 +140,26 @@ const ApplicationFormManualV0: FC<ApplicationFormProps> = ({
     enableReinitialize: true,
     async onSubmit(values) {
       if (detailApp) {
-        await dispatch(
-          updateApplication({
+        updateApplication(
+          {
             ...values,
             applicationId: detailApp.id,
-          })
-        )
-          .then(unwrapResult)
-          .then(() => {
-            formik.resetForm();
-            onFinished();
-          });
+          },
+          {
+            onSuccess: () => {
+              formik.resetForm();
+              onFinished();
+            },
+          }
+        );
       }
       if (!detailApp) {
-        await dispatch(addApplication(values))
-          .then(unwrapResult)
-          .then(() => {
+        addApplication(values, {
+          onSuccess: () => {
             formik.resetForm();
             onFinished();
-          });
+          },
+        });
       }
     },
   });
@@ -213,13 +183,16 @@ const ApplicationFormManualV0: FC<ApplicationFormProps> = ({
     setIsSubmitting?.(isSubmitting);
   }, [isSubmitting, setIsSubmitting]);
 
-  const classes = useStyles();
-  const ps = useAppSelector((state) => selectAllPipeds(state));
+  const { data: ps = [], isLoading: isLoadingPiped } = useGetPipeds({
+    withStatus: true,
+  });
   const pipedOptions = ps
     .filter((piped) => !piped.disabled || piped.id === detailApp?.pipedId)
     .sort((a, b) => sortFunc(a.name, b.name));
 
-  const selectedPiped = useAppSelector(selectPipedById(values.pipedId));
+  const selectedPiped = useMemo(() => {
+    return pipedOptions.find((piped) => piped.id === values.pipedId);
+  }, [pipedOptions, values.pipedId]);
 
   const platformProviders = createPlatformProviderListFromPiped({
     piped: selectedPiped,
@@ -231,12 +204,21 @@ const ApplicationFormManualV0: FC<ApplicationFormProps> = ({
   const disableApplicationInfo = !!detailApp;
 
   return (
-    <Box width="100%">
-      <Typography className={classes.title} variant="h6">
+    <Box
+      sx={{
+        width: "100%",
+      }}
+    >
+      <Typography
+        variant="h6"
+        sx={{
+          p: 2,
+        }}
+      >
         {title}
       </Typography>
       <Divider />
-      <form className={classes.form} onSubmit={handleSubmit}>
+      <StyledForm onSubmit={handleSubmit}>
         <TextField
           id="name"
           name="name"
@@ -247,7 +229,6 @@ const ApplicationFormManualV0: FC<ApplicationFormProps> = ({
           fullWidth
           required
           disabled={isSubmitting || disableApplicationInfo}
-          className={classes.textInput}
         />
 
         <FormSelectInput
@@ -265,11 +246,11 @@ const ApplicationFormManualV0: FC<ApplicationFormProps> = ({
           disabled={isSubmitting || disableApplicationInfo}
         />
 
-        <div className={classes.inputGroup}>
+        <GroupTwoCol>
           <FormSelectInput
             id="piped"
             label="Piped"
-            value={values.pipedId}
+            value={isLoadingPiped ? "" : values.pipedId}
             onChange={(value) => {
               setValues({
                 ...emptyFormValues,
@@ -289,7 +270,7 @@ const ApplicationFormManualV0: FC<ApplicationFormProps> = ({
           <FormSelectInput
             id="platformProvider"
             label="Platform Provider"
-            value={values.platformProvider}
+            value={isLoadingPiped ? "" : values.platformProvider}
             onChange={(value) => setFieldValue("platformProvider", value)}
             getOptionLabel={(option) => option.name}
             options={platformProviders}
@@ -300,13 +281,13 @@ const ApplicationFormManualV0: FC<ApplicationFormProps> = ({
               isSubmitting
             }
           />
-        </div>
+        </GroupTwoCol>
 
-        <div className={classes.inputGroup}>
+        <GroupTwoCol>
           <FormSelectInput
             id="git-repo"
             label="Repository"
-            value={values.repo.id || ""}
+            value={isLoadingPiped ? "" : values.repo.id || ""}
             getOptionLabel={(option) => option.name}
             options={repositories}
             onChange={(_value, item) =>
@@ -340,7 +321,7 @@ const ApplicationFormManualV0: FC<ApplicationFormProps> = ({
             fullWidth
             required
           />
-        </div>
+        </GroupTwoCol>
 
         <TextField
           id="configFilename"
@@ -351,25 +332,26 @@ const ApplicationFormManualV0: FC<ApplicationFormProps> = ({
           value={values.configFilename}
           fullWidth
           required
-          className={classes.textInput}
         />
 
-        <Box my={2}>
+        <Box
+          sx={{
+            my: 2,
+          }}
+        >
           <Button
             color="primary"
             type="submit"
             disabled={isValid === false || isSubmitting || dirty === false}
           >
             {UI_TEXT_SAVE}
-            {isSubmitting && (
-              <CircularProgress size={24} className={classes.buttonProgress} />
-            )}
+            {isSubmitting && <SpinnerIcon />}
           </Button>
           <Button onClick={onClose} disabled={isSubmitting}>
             {UI_TEXT_CANCEL}
           </Button>
         </Box>
-      </form>
+      </StyledForm>
     </Box>
   );
 };

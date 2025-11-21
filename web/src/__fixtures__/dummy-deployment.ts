@@ -1,11 +1,11 @@
 import { ApplicationKind } from "pipecd/web/model/common_pb";
-import { Deployment, DeploymentStatus } from "~/modules/deployments";
 import { createGitPathFromObject } from "./common";
 import { dummyApplication } from "./dummy-application";
 import { dummyPiped } from "./dummy-piped";
 import { createPipelineFromObject, dummyPipeline } from "./dummy-pipeline";
 import { createTriggerFromObject, dummyTrigger } from "./dummy-trigger";
 import { createRandTimes, randomUUID } from "./utils";
+import { Deployment, DeploymentStatus } from "~/types/deployment";
 
 const [createdAt, completedAt] = createRandTimes(3);
 
@@ -21,7 +21,6 @@ export const dummyDeployment: Deployment.AsObject = {
   status: DeploymentStatus.DEPLOYMENT_SUCCESS,
   statusReason: "good",
   trigger: dummyTrigger,
-  version: "0.0.0",
   versionsList: [],
   cloudProvider: "kube-1",
   platformProvider: "kube-1",
@@ -65,10 +64,11 @@ export function createDeploymentFromObject(o: Deployment.AsObject): Deployment {
   deployment.setStatusReason(o.statusReason);
   deployment.setSummary(o.summary);
   deployment.setUpdatedAt(o.updatedAt);
-  deployment.setVersion(o.version);
-  o.gitPath && deployment.setGitPath(createGitPathFromObject(o.gitPath));
-  o.trigger && deployment.setTrigger(createTriggerFromObject(o.trigger));
-  o.stagesList &&
+
+  if (o.gitPath) deployment.setGitPath(createGitPathFromObject(o.gitPath));
+  if (o.trigger) deployment.setTrigger(createTriggerFromObject(o.trigger));
+  if (o.stagesList)
     deployment.setStagesList(createPipelineFromObject(o.stagesList));
+
   return deployment;
 }

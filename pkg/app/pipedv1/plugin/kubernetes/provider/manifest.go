@@ -15,13 +15,15 @@
 package provider
 
 import (
-	"encoding/json"
 	"maps"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/yaml"
 
-	"github.com/pipe-cd/pipecd/pkg/plugin/sdk"
+	sdk "github.com/pipe-cd/piped-plugin-sdk-go"
 )
 
 var builtinAPIGroups = map[string]struct{}{
@@ -57,16 +59,104 @@ type Manifest struct {
 	body *unstructured.Unstructured
 }
 
+// FromUnstructured creates a new Manifest from a Kubernetes unstructured object.
+func FromUnstructured(u *unstructured.Unstructured) Manifest {
+	return Manifest{body: u}
+}
+
+// FromStructuredObject creates a new Manifest from a structured Kubernetes object.
+func FromStructuredObject(o any) (Manifest, error) {
+	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(o)
+	if err != nil {
+		return Manifest{}, err
+	}
+	return Manifest{body: &unstructured.Unstructured{Object: obj}}, nil
+}
+
+// DeepCopyManifests returns a deep copy of the given manifests.
+func DeepCopyManifests(manifests []Manifest) []Manifest {
+	copied := make([]Manifest, len(manifests))
+	for i, m := range manifests {
+		copied[i] = m.DeepCopy()
+	}
+	return copied
+}
+
+// DeepCopy returns a deep copy of the manifest.
+func (m Manifest) DeepCopy() Manifest {
+	return Manifest{body: m.body.DeepCopy()}
+}
+
+// DeepCopyWithName returns a deep copy of the manifest with the given name.
+func (m Manifest) DeepCopyWithName(name string) Manifest {
+	copied := m.DeepCopy()
+	copied.body.SetName(name)
+	return copied
+}
+
 func (m Manifest) Key() ResourceKey {
 	return makeResourceKey(m.body)
+}
+
+// ApplicationID returns the application ID of the resource.
+func (m Manifest) ApplicationID() string {
+	return m.body.GetAnnotations()[LabelApplication]
+}
+
+// OwnerReferences returns the owner references of the resource.
+func (m Manifest) OwnerReferences() []types.UID {
+	refs := m.body.GetOwnerReferences()
+	ownerRefs := make([]types.UID, 0, len(refs))
+	for _, ref := range refs {
+		ownerRefs = append(ownerRefs, ref.UID)
+	}
+	return ownerRefs
+}
+
+// UID returns the UID of the resource.
+// This will be empty when this manifest is loaded form the manifest file.
+// This will be non-empty when this manifest is loaded from the live state.
+func (m Manifest) UID() types.UID {
+	return m.body.GetUID()
+}
+
+func (m Manifest) GroupVersionKind() schema.GroupVersionKind {
+	return m.body.GroupVersionKind()
 }
 
 func (m Manifest) Kind() string {
 	return m.body.GetKind()
 }
 
+func (m Manifest) APIVersion() string {
+	return m.body.GetAPIVersion()
+}
+
 func (m Manifest) Name() string {
 	return m.body.GetName()
+}
+
+// IsWorkload returns true if the manifest is a Deployment, StatefulSet, or DaemonSet.
+// It checks the API group and the kind of the manifest.
+func (m Manifest) IsWorkload() bool {
+	// TODO: check the API group more strictly.
+	if !isBuiltinAPIGroup(m.body.GroupVersionKind().Group) {
+		return false
+	}
+
+	switch m.body.GetKind() {
+	case KindDeployment, KindReplicaSet, KindDaemonSet, KindPod, KindStatefulSet:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsService returns true if the manifest is a Service.
+// It checks the API group and the kind of the manifest.
+func (m Manifest) IsService() bool {
+	// TODO: check the API group more strictly.
+	return isBuiltinAPIGroup(m.body.GroupVersionKind().Group) && m.body.GetKind() == KindService
 }
 
 // IsDeployment returns true if the manifest is a Deployment.
@@ -74,6 +164,20 @@ func (m Manifest) Name() string {
 func (m Manifest) IsDeployment() bool {
 	// TODO: check the API group more strictly.
 	return isBuiltinAPIGroup(m.body.GroupVersionKind().Group) && m.body.GetKind() == KindDeployment
+}
+
+// IsStatefulSet returns true if the manifest is a StatefulSet.
+// It checks the API group and the kind of the manifest.
+func (m Manifest) IsStatefulSet() bool {
+	// TODO: check the API group more strictly.
+	return isBuiltinAPIGroup(m.body.GroupVersionKind().Group) && m.body.GetKind() == KindStatefulSet
+}
+
+// IsReplicaSet returns true if the manifest is a ReplicaSet.
+// It checks the API group and the kind of the manifest.
+func (m Manifest) IsReplicaSet() bool {
+	// TODO: check the API group more strictly.
+	return isBuiltinAPIGroup(m.body.GroupVersionKind().Group) && m.body.GetKind() == KindReplicaSet
 }
 
 // IsSecret returns true if the manifest is a Secret.
@@ -104,13 +208,9 @@ func (m *Manifest) MarshalJSON() ([]byte, error) {
 
 // ConvertToStructuredObject converts the manifest into a structured Kubernetes object.
 // The provided interface should be a pointer to a concrete Kubernetes type (e.g. *v1.Pod).
-// It first marshals the manifest to JSON and then unmarshals it into the provided object.
-func (m Manifest) ConvertToStructuredObject(o interface{}) error {
-	data, err := m.MarshalJSON()
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(data, o)
+// It uses the runtime.DefaultUnstructuredConverter to convert the manifest into the provided object.
+func (m Manifest) ConvertToStructuredObject(o any) error {
+	return runtime.DefaultUnstructuredConverter.FromUnstructured(m.body.Object, o)
 }
 
 func (m *Manifest) YamlBytes() ([]byte, error) {
@@ -123,6 +223,10 @@ func (m Manifest) GetAnnotations() map[string]string {
 
 func (m Manifest) NestedMap(fields ...string) (map[string]any, bool, error) {
 	return unstructured.NestedMap(m.body.Object, fields...)
+}
+
+func (m Manifest) NestedString(fields ...string) (string, bool, error) {
+	return unstructured.NestedString(m.body.Object, fields...)
 }
 
 func (m Manifest) AddLabels(labels map[string]string) {
@@ -187,12 +291,14 @@ func (m Manifest) ToResourceState(deployTarget string) sdk.ResourceState {
 		}
 	}
 
+	status, desc := m.calculateHealthStatus()
+
 	return sdk.ResourceState{
 		ID:                string(m.body.GetUID()),
 		Name:              m.body.GetName(),
 		ParentIDs:         parents,
-		HealthStatus:      sdk.ResourceHealthStateUnknown, // TODO: Implement health status calculation
-		HealthDescription: "",                             // TODO: Implement health status calculation
+		HealthStatus:      status,
+		HealthDescription: desc,
 		ResourceType:      m.body.GetKind(),
 		ResourceMetadata: map[string]string{
 			"Namespace":   m.body.GetNamespace(),

@@ -1,42 +1,54 @@
 import userEvent from "@testing-library/user-event";
 import { UI_TEXT_CLEAR } from "~/constants/ui-text";
-import { ApplicationKind, ApplicationSyncStatus } from "~/modules/applications";
+import { ApplicationKind, ApplicationSyncStatus } from "~/types/applications";
 import { dummyApplication } from "~/__fixtures__/dummy-application";
-import { render, screen } from "~~/test-utils";
+import { render, screen, waitFor } from "~~/test-utils";
 import { ApplicationFilter } from ".";
+import { server } from "~/mocks/server";
 
-const initialState = {
-  applications: {
-    ids: [dummyApplication.id],
-    entities: { [dummyApplication.id]: dummyApplication },
-  },
-};
+beforeAll(() => {
+  server.listen();
+});
 
-test("Change filter values", () => {
+afterEach(() => {
+  server.resetHandlers();
+});
+
+afterAll(() => {
+  server.close();
+});
+
+test("Change filter values", async () => {
   const onChange = jest.fn();
   render(
-    <ApplicationFilter onChange={onChange} onClear={() => null} options={{}} />,
-    {
-      initialState,
-    }
+    <ApplicationFilter
+      onChange={onChange}
+      onClear={() => null}
+      options={{}}
+      applications={[]}
+    />
   );
 
   userEvent.type(
-    screen.getByRole("textbox", { name: "Application Name" }),
+    screen.getByRole("combobox", { name: "Application Name" }),
     dummyApplication.name
   );
-  userEvent.click(screen.getByRole("option", { name: dummyApplication.name }));
+  await waitFor(() => {
+    userEvent.click(
+      screen.getByRole("option", { name: dummyApplication.name })
+    );
+  });
 
   expect(onChange).toHaveBeenCalledWith({ name: dummyApplication.name });
   onChange.mockClear();
 
-  userEvent.click(screen.getByRole("button", { name: /kind/i }));
+  userEvent.click(screen.getByRole("combobox", { name: /kind/i }));
   userEvent.click(screen.getByRole("option", { name: /kubernetes/i }));
 
   expect(onChange).toHaveBeenCalledWith({ kind: ApplicationKind.KUBERNETES });
   onChange.mockClear();
 
-  userEvent.click(screen.getByRole("button", { name: /sync status/i }));
+  userEvent.click(screen.getByRole("combobox", { name: /sync status/i }));
   userEvent.click(screen.getByRole("option", { name: /synced/i }));
 
   expect(onChange).toHaveBeenCalledWith({
@@ -44,7 +56,7 @@ test("Change filter values", () => {
   });
   onChange.mockClear();
 
-  userEvent.click(screen.getByRole("button", { name: /active status/i }));
+  userEvent.click(screen.getByRole("combobox", { name: /active status/i }));
   userEvent.click(screen.getByRole("option", { name: /enabled/i }));
 
   expect(onChange).toHaveBeenCalledWith({ activeStatus: "enabled" });
@@ -54,10 +66,12 @@ test("Change filter values", () => {
 test("Click clear filter", () => {
   const onClear = jest.fn();
   render(
-    <ApplicationFilter onChange={() => null} onClear={onClear} options={{}} />,
-    {
-      initialState,
-    }
+    <ApplicationFilter
+      onChange={() => null}
+      onClear={onClear}
+      options={{}}
+      applications={[]}
+    />
   );
 
   userEvent.click(screen.getByRole("button", { name: UI_TEXT_CLEAR }));

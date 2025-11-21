@@ -4,53 +4,26 @@ import {
   DialogActions,
   DialogContent,
   Typography,
-  makeStyles,
   DialogTitle,
   TextField,
-} from "@material-ui/core";
+} from "@mui/material";
 import { useFormik } from "formik";
 import { FC, memo } from "react";
-import { useAppSelector } from "~/hooks/redux";
-import {
-  formalizePoliciesList,
-  rbacResourceTypes,
-  rbacActionTypes,
-} from "~/modules/project";
 import * as yup from "yup";
-
-const useStyles = makeStyles((theme) => ({
-  deleteTargetName: {
-    color: theme.palette.text.primary,
-    fontWeight: theme.typography.fontWeightMedium,
-  },
-  description: {
-    marginBottom: theme.spacing(2),
-  },
-}));
+import { formalizePoliciesList } from "~/utils/formalize-policies-list";
+import { POLICIES_STRING_REGEX } from "~/constants/project";
+import { ProjectRBACRole } from "pipecd/web/model/project_pb";
 
 export interface EditRoleDialogProps {
-  role: string | null;
+  role: ProjectRBACRole.AsObject | null;
   onClose: () => void;
   onUpdate: (values: { name: string; policies: string }) => void;
 }
 
-// resources=(\*|application|deployment|event|piped|deploymentChain|project|apiKey|insight|,)+;\s*actions=(\*|get|list|create|update|delete|,)+
-const validationRgex = new RegExp(
-  "resources=(" +
-    rbacResourceTypes()
-      .map((v) => v.replace(/\*/, "\\*"))
-      .join("|") +
-    "|,)+;\\s*actions=(" +
-    rbacActionTypes()
-      .map((v) => v.replace(/\*/, "\\*"))
-      .join("|") +
-    "|,)+"
-);
-
 const validationSchema = yup.object({
   policies: yup
     .string()
-    .matches(validationRgex, "Invalid policy format")
+    .matches(POLICIES_STRING_REGEX, "Invalid policy format")
     .required(),
 });
 
@@ -58,21 +31,17 @@ const DIALOG_TITLE = "Edit Role";
 
 export const EditRoleDialog: FC<EditRoleDialogProps> = memo(
   function EditRoleDialog({ role, onUpdate, onClose }) {
-    const classes = useStyles();
-    const rs = useAppSelector((state) => state.project.rbacRoles);
-    const r = rs.filter((r) => r.name == role)[0];
-
     const formik = useFormik({
       initialValues: {
         policies: formalizePoliciesList({
-          policiesList: r?.policiesList || [],
+          policiesList: role?.policiesList || [],
         }),
       },
       enableReinitialize: true,
       validationSchema,
       onSubmit: (values, actions) => {
         onUpdate({
-          name: role || "",
+          name: role?.name || "",
           policies: values.policies,
         });
         actions.resetForm();
@@ -80,13 +49,19 @@ export const EditRoleDialog: FC<EditRoleDialogProps> = memo(
     });
 
     return (
-      <Dialog open={Boolean(r)} onClose={onClose} fullWidth>
+      <Dialog open={Boolean(role)} onClose={onClose} fullWidth>
         <form onSubmit={formik.handleSubmit}>
           <DialogTitle>{DIALOG_TITLE}</DialogTitle>
           <DialogContent>
             <Typography variant="caption">Role</Typography>
-            <Typography variant="body1" className={classes.deleteTargetName}>
-              {role}
+            <Typography
+              variant="body1"
+              sx={(theme) => ({
+                color: theme.palette.text.primary,
+                fontWeight: theme.typography.fontWeightMedium,
+              })}
+            >
+              {role?.name}
             </Typography>
             <TextField
               id="policies"

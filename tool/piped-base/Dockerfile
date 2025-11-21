@@ -1,4 +1,4 @@
-FROM alpine:3.21.3
+FROM alpine:3.22.2
 
 ARG PIPED_USER=piped
 ARG PIPED_USER_GROUP=piped
@@ -17,7 +17,8 @@ RUN \
         git \
         openssh \
         jq \
-        curl && \
+        curl \
+        tini && \
     update-ca-certificates && \
     mkdir -p ${PIPED_TOOLS_DIR} && \
     rm -f /var/cache/apk/* && \

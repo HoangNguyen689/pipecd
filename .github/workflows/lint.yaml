@@ -7,29 +7,66 @@ on:
   pull_request:
     branches:
       - master
-      - 'release-v*'
+      - "release-v*"
+      - "feat/*"
 
 env:
-  GO_VERSION: 1.24.1
+  GO_VERSION: 1.25.0
   NODE_VERSION: 18.12.0
-  GOLANGCI_LINT_VERSION: v1.64.7
+  GOLANGCI_LINT_VERSION: v2.4.0
+  HELM_VERSION: 3.17.3
 
 jobs:
+  list-go-modules:
+    runs-on: ubuntu-24.04
+    outputs:
+      modules: ${{ steps.list-go-modules.outputs.modules }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: List go modules
+        id: list-go-modules
+        run: |
+          echo "modules=$(find . -name go.mod -exec dirname {} \; | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> $GITHUB_OUTPUT
+
   go:
     runs-on: ubuntu-24.04
+    needs: list-go-modules
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJSON(needs.list-go-modules.outputs.modules) }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: golangci-lint
-        uses: reviewdog/action-golangci-lint@f3dc5fadcaff5d8da3574b129a58db433171b1a8 #v2.1.3
+        uses: reviewdog/action-golangci-lint@f9bba13753278f6a73b27a56a3ffb1bfda90ed71 #v2.8.0
         with:
+          workdir: ${{ matrix.module }}
           go_version: ${{ env.GO_VERSION }}
           golangci_lint_version: ${{ env.GOLANGCI_LINT_VERSION }}
-          fail_on_error: true # this option is deprecated on v2.7.0, but we use v2.1.3, so it's still available
+          golangci_lint_flags: --config ${{ github.workspace }}/.golangci.yml
+          fail_level: error
+
+  # This job is used to check if the go linting is completed successfully
+  # It is used to set as required check for the branch protection rules
+  go-lint-completed:
+    runs-on: ubuntu-24.04
+    if: always()
+    needs: go
+    steps:
+      - name: Check if all go lint jobs succeeded
+        # if jobs in the 'go' job matrix failed or were cancelled, this job will fail
+        # otherwise this job is marked as successful because all steps are skipped
+        run: exit 1
+        if: >-
+          ${{
+               contains(needs.*.result, 'failure')
+            || contains(needs.*.result, 'cancelled')
+          }}
 
   web:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-node@v3
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -47,3 +84,16 @@ jobs:
         run: make update/web-deps
       - name: Run lint
         run: make lint/web
+  helm:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Lint all Helm charts
+        run: make lint/helm

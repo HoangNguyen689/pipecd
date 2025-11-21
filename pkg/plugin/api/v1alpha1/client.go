@@ -21,34 +21,46 @@ import (
 
 	"github.com/pipe-cd/pipecd/pkg/plugin/api/v1alpha1/deployment"
 	"github.com/pipe-cd/pipecd/pkg/plugin/api/v1alpha1/livestate"
+	"github.com/pipe-cd/pipecd/pkg/plugin/api/v1alpha1/planpreview"
 	"github.com/pipe-cd/pipecd/pkg/rpc/rpcclient"
 )
 
 type PluginClient interface {
 	deployment.DeploymentServiceClient
 	livestate.LivestateServiceClient
+	planpreview.PlanPreviewServiceClient
 	Close() error
+	Name() string
 }
 
 type client struct {
 	deployment.DeploymentServiceClient
 	livestate.LivestateServiceClient
+	planpreview.PlanPreviewServiceClient
 	conn *grpc.ClientConn
+
+	name string
 }
 
-func NewClient(ctx context.Context, address string, opts ...rpcclient.DialOption) (PluginClient, error) {
+func NewClient(ctx context.Context, name string, address string, opts ...rpcclient.DialOption) (PluginClient, error) {
 	conn, err := rpcclient.DialContext(ctx, address, opts...)
 	if err != nil {
 		return nil, err
 	}
 
 	return &client{
-		DeploymentServiceClient: deployment.NewDeploymentServiceClient(conn),
-		LivestateServiceClient:  livestate.NewLivestateServiceClient(conn),
-		conn:                    conn,
+		DeploymentServiceClient:  deployment.NewDeploymentServiceClient(conn),
+		LivestateServiceClient:   livestate.NewLivestateServiceClient(conn),
+		PlanPreviewServiceClient: planpreview.NewPlanPreviewServiceClient(conn),
+		conn:                     conn,
+		name:                     name,
 	}, nil
 }
 
 func (c *client) Close() error {
 	return c.conn.Close()
+}
+
+func (c *client) Name() string {
+	return c.name
 }

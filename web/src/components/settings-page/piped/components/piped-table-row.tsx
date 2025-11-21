@@ -8,21 +8,20 @@ import {
   DialogContentText,
   DialogTitle,
   IconButton,
-  makeStyles,
   Menu,
   MenuItem,
   TableCell,
   TableRow,
   Typography,
   Tooltip,
-} from "@material-ui/core";
-import { MoreVert as MoreVertIcon } from "@material-ui/icons";
-import clsx from "clsx";
+} from "@mui/material";
+import { MoreVert as MoreVertIcon } from "@mui/icons-material";
 import dayjs from "dayjs";
 import { Highlight, themes } from "prism-react-renderer";
 import * as React from "react";
 import { FC, memo, useCallback, useState } from "react";
 import { CopyIconButton } from "~/components/copy-icon-button";
+import DialogConfirm from "~/components/dialog-confirm";
 import { PIPED_CONNECTION_STATUS_TEXT } from "~/constants/piped-connection-status-text";
 import { DELETE_OLD_PIPED_KEY_SUCCESS } from "~/constants/toast-text";
 import {
@@ -33,83 +32,40 @@ import {
   UI_TEXT_EDIT,
   UI_TEXT_ENABLE,
   UI_TEXT_RESTART,
+  UI_TEXT_CANCEL,
 } from "~/constants/ui-text";
-import { useAppDispatch, useAppSelector } from "~/hooks/redux";
-import {
-  addNewPipedKey,
-  deleteOldKey,
-  fetchPipeds,
-  Piped,
-  selectPipedById,
-} from "~/modules/pipeds";
-import { addToast } from "~/modules/toasts";
-
-const useStyles = makeStyles((theme) => ({
-  disabledItem: {
-    background: theme.palette.grey[200],
-  },
-  idCell: {
-    "& button": {
-      visibility: "hidden",
-    },
-    "&:hover button": {
-      visibility: "visible",
-    },
-  },
-  connectionStatus: {
-    paddingLeft: theme.spacing(1.5),
-  },
-  onlineStatus: {
-    "& span": {
-      backgroundColor: "green",
-    },
-  },
-  offlineStatus: {
-    "& span": {
-      backgroundColor: "red",
-    },
-  },
-  unknownStatus: {
-    "& span": {
-      backgroundColor: "grey",
-    },
-  },
-  codeBlock: {
-    padding: theme.spacing(2),
-    overflow: "auto",
-  },
-}));
+import { Piped } from "pipecd/web/model/piped_pb";
+import { useToast } from "~/contexts/toast-context";
+import { useDeleteOldPipedKey } from "~/queries/pipeds/use-delete-old-piped-key";
 
 interface Props {
-  pipedId: string;
-  onEdit: (id: string) => void;
+  piped: Piped.AsObject;
+  onEdit: (piped: Piped.AsObject) => void;
+  onAddNewKey: (piped: Piped.AsObject) => void;
   onDisable: (id: string) => void;
   onEnable: (id: string) => void;
   onRestart: (id: string) => void;
 }
 
 const ITEM_HEIGHT = 48;
-const menuStyle = {
-  style: {
-    maxHeight: ITEM_HEIGHT * 5.5,
-    width: "25ch",
-  },
-};
 
 export const PipedTableRow: FC<Props> = memo(function PipedTableRow({
-  pipedId,
+  piped,
   onEnable,
   onDisable,
   onEdit,
   onRestart,
+  onAddNewKey,
 }) {
-  const classes = useStyles();
-  const piped = useAppSelector(selectPipedById(pipedId));
-  const dispatch = useAppDispatch();
   const [anchorEl, setAnchorEl] = useState<HTMLButtonElement | null>(null);
   const hasOldKey = piped ? piped.keysList.length > 1 : false;
   const [openOldKeyAlert, setOpenOldKeyAlert] = useState(false);
   const [openConfigAlert, setOpenConfigAlert] = useState(false);
+  const [openConfirmAddKey, setOpenConfirmAddKey] = useState(false);
+
+  const { addToast } = useToast();
+
+  const { mutateAsync: deleteOldPipedKey } = useDeleteOldPipedKey();
 
   const handleMenuOpen = useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -129,30 +85,36 @@ export const PipedTableRow: FC<Props> = memo(function PipedTableRow({
 
   const handleEdit = useCallback(() => {
     setAnchorEl(null);
-    onEdit(pipedId);
-  }, [pipedId, onEdit]);
+    onEdit(piped);
+  }, [piped, onEdit]);
 
   const handleAddNewKey = useCallback(() => {
     setAnchorEl(null);
     if (hasOldKey) {
       setOpenOldKeyAlert(true);
     } else {
-      dispatch(addNewPipedKey({ pipedId }));
+      setOpenConfirmAddKey(true);
     }
-  }, [dispatch, pipedId, hasOldKey]);
+  }, [hasOldKey]);
+
+  const handleConfirmAddKey = useCallback(() => {
+    setOpenConfirmAddKey(false);
+    onAddNewKey(piped);
+  }, [onAddNewKey, piped]);
+
+  const handleCancelAddKey = useCallback(() => {
+    setOpenConfirmAddKey(false);
+  }, []);
 
   const handleDeleteOldKey = useCallback(() => {
     setAnchorEl(null);
-    dispatch(deleteOldKey({ pipedId })).then(() => {
-      dispatch(fetchPipeds(true));
-      dispatch(
-        addToast({
-          message: DELETE_OLD_PIPED_KEY_SUCCESS,
-          severity: "success",
-        })
-      );
+    deleteOldPipedKey({ pipedId: piped.id }).then(() => {
+      addToast({
+        message: DELETE_OLD_PIPED_KEY_SUCCESS,
+        severity: "success",
+      });
     });
-  }, [pipedId, dispatch]);
+  }, [addToast, deleteOldPipedKey, piped.id]);
 
   const handleOpenPipedConfig = useCallback(() => {
     setAnchorEl(null);
@@ -161,54 +123,69 @@ export const PipedTableRow: FC<Props> = memo(function PipedTableRow({
 
   const handleEnable = useCallback(() => {
     setAnchorEl(null);
-    onEnable(pipedId);
-  }, [pipedId, onEnable]);
+    onEnable(piped.id);
+  }, [piped.id, onEnable]);
 
   const handleDisable = useCallback(() => {
     setAnchorEl(null);
-    onDisable(pipedId);
-  }, [pipedId, onDisable]);
+    onDisable(piped.id);
+  }, [piped.id, onDisable]);
 
   const handleRestart = useCallback(() => {
     setAnchorEl(null);
-    onRestart(pipedId);
-  }, [pipedId, onRestart]);
+    onRestart(piped.id);
+  }, [piped.id, onRestart]);
 
   if (!piped) {
     return null;
   }
 
+  const badgeColor = {
+    [Piped.ConnectionStatus.ONLINE]: "green",
+    [Piped.ConnectionStatus.OFFLINE]: "red",
+    [Piped.ConnectionStatus.UNKNOWN]: "grey",
+  };
+
   return (
     <>
       <TableRow
         key={`pipe-${piped.id}`}
-        className={clsx({ [classes.disabledItem]: piped.disabled })}
+        sx={{ bgcolor: piped.disabled ? "grey.200" : undefined }}
       >
         <TableCell>
           <Typography variant="subtitle2">
             {piped.name}
             <Tooltip
-              className={classes.connectionStatus}
               placement="top"
               title={PIPED_CONNECTION_STATUS_TEXT[piped.status]}
             >
               <Badge
                 variant="dot"
                 overlap="rectangular"
-                className={clsx({
-                  [classes.onlineStatus]:
-                    piped.status === Piped.ConnectionStatus.ONLINE,
-                  [classes.offlineStatus]:
-                    piped.status === Piped.ConnectionStatus.OFFLINE,
-                  [classes.unknownStatus]:
-                    piped.status === Piped.ConnectionStatus.UNKNOWN,
-                })}
+                sx={{
+                  paddingLeft: 1.5,
+                  "& span": {
+                    backgroundColor: badgeColor[piped.status],
+                  },
+                }}
               />
             </Tooltip>
           </Typography>
         </TableCell>
-        <TableCell title={piped.id} className={classes.idCell}>
-          <Box display="flex" alignItems="center" fontFamily="fontFamilyMono">
+        <TableCell
+          title={piped.id}
+          sx={{
+            "& button": { visibility: "hidden" },
+            "&:hover button": { visibility: "visible" },
+          }}
+        >
+          <Box
+            sx={{
+              display: "flex",
+              alignItems: "center",
+              fontFamily: "fontFamilyMono",
+            }}
+          >
             {piped.id}
             <CopyIconButton name="Piped ID" value={piped.id} />
           </Box>
@@ -234,18 +211,25 @@ export const PipedTableRow: FC<Props> = memo(function PipedTableRow({
             edge="end"
             aria-label="open menu"
             onClick={handleMenuOpen}
+            size="large"
           >
             <MoreVertIcon />
           </IconButton>
         </TableCell>
       </TableRow>
-
       <Menu
         id="piped-menu"
         anchorEl={anchorEl}
         open={Boolean(anchorEl)}
         onClose={handleMenuClose}
-        PaperProps={menuStyle}
+        slotProps={{
+          paper: {
+            style: {
+              maxHeight: ITEM_HEIGHT * 5.5,
+              width: "25ch",
+            },
+          },
+        }}
       >
         {piped.disabled ? (
           <MenuItem onClick={handleEnable}>{UI_TEXT_ENABLE}</MenuItem>
@@ -284,7 +268,6 @@ export const PipedTableRow: FC<Props> = memo(function PipedTableRow({
           ]
         )}
       </Menu>
-
       <Dialog open={openOldKeyAlert} onClose={handleAlertClose}>
         <DialogTitle>There are already 2 keys for this piped</DialogTitle>
         <DialogContent>
@@ -298,7 +281,15 @@ export const PipedTableRow: FC<Props> = memo(function PipedTableRow({
           </Button>
         </DialogActions>
       </Dialog>
-
+      <DialogConfirm
+        open={openConfirmAddKey}
+        onCancel={handleCancelAddKey}
+        onConfirm={handleConfirmAddKey}
+        title="Add new piped key"
+        description={`This piped has one key. Are you sure you want to generate a new key?\nAfter adding a new key and selecting 'Delete old key', the existing key will no longer be valid.`}
+        confirmText={UI_TEXT_ADD_NEW_KEY}
+        cancelText={UI_TEXT_CANCEL}
+      />
       <Dialog
         fullWidth
         maxWidth="md"
@@ -312,7 +303,14 @@ export const PipedTableRow: FC<Props> = memo(function PipedTableRow({
         <DialogContent>
           <Highlight theme={themes.github} code={piped.config} language="yaml">
             {({ style, tokens, getLineProps, getTokenProps }) => (
-              <pre style={style} className={classes.codeBlock}>
+              <Box
+                component={"pre"}
+                style={style}
+                sx={{
+                  padding: 2,
+                  overflow: "auto",
+                }}
+              >
                 {tokens.map((line, i) => (
                   <div key={i} {...getLineProps({ line })}>
                     {line.map((token, key) => (
@@ -320,7 +318,7 @@ export const PipedTableRow: FC<Props> = memo(function PipedTableRow({
                     ))}
                   </div>
                 ))}
-              </pre>
+              </Box>
             )}
           </Highlight>
         </DialogContent>

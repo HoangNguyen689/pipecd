@@ -1,6 +1,9 @@
 quickstart:
   enabled: true
 
+localStorageVolumes:
+  enabled: false
+
 config:
   data: |
     apiVersion: "pipecd.dev/v1beta1"

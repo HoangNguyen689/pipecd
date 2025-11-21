@@ -32,6 +32,7 @@ import (
 	"github.com/pipe-cd/pipecd/pkg/app/server/analysisresultstore"
 	"github.com/pipe-cd/pipecd/pkg/app/server/apikeyverifier"
 	"github.com/pipe-cd/pipecd/pkg/app/server/applicationlivestatestore"
+	"github.com/pipe-cd/pipecd/pkg/app/server/applicationsharedobjectstore"
 	"github.com/pipe-cd/pipecd/pkg/app/server/commandoutputstore"
 	"github.com/pipe-cd/pipecd/pkg/app/server/grpcapi"
 	"github.com/pipe-cd/pipecd/pkg/app/server/grpcapi/grpcapimetrics"
@@ -41,14 +42,12 @@ import (
 	"github.com/pipe-cd/pipecd/pkg/app/server/service/webservice"
 	"github.com/pipe-cd/pipecd/pkg/app/server/stagelogstore"
 	"github.com/pipe-cd/pipecd/pkg/app/server/unregisteredappstore"
-	"github.com/pipe-cd/pipecd/pkg/cache"
 	"github.com/pipe-cd/pipecd/pkg/cache/cachemetrics"
 	"github.com/pipe-cd/pipecd/pkg/cache/rediscache"
 	"github.com/pipe-cd/pipecd/pkg/cli"
 	"github.com/pipe-cd/pipecd/pkg/config"
 	"github.com/pipe-cd/pipecd/pkg/crypto"
 	"github.com/pipe-cd/pipecd/pkg/datastore"
-	"github.com/pipe-cd/pipecd/pkg/datastore/filedb"
 	"github.com/pipe-cd/pipecd/pkg/datastore/firestore"
 	"github.com/pipe-cd/pipecd/pkg/datastore/mysql"
 	"github.com/pipe-cd/pipecd/pkg/filestore"
@@ -177,8 +176,7 @@ func (s *server) run(ctx context.Context, input cli.Input) error {
 	}()
 	input.Logger.Info("successfully connected to file store")
 
-	dbCache := rediscache.NewTTLCache(rd, 3*time.Hour)
-	ds, err := createDatastore(ctx, cfg, fs, dbCache, input.Logger)
+	ds, err := createDatastore(ctx, cfg, input.Logger)
 	if err != nil {
 		input.Logger.Error("failed to create datastore", zap.Error(err))
 		return err
@@ -196,6 +194,7 @@ func (s *server) run(ctx context.Context, input cli.Input) error {
 		sls                  = stagelogstore.NewStore(fs, cache, input.Logger)
 		alss                 = applicationlivestatestore.NewStore(fs, cache, input.Logger)
 		las                  = analysisresultstore.NewStore(fs, input.Logger)
+		aso                  = applicationsharedobjectstore.NewStore(fs, input.Logger)
 		insightStore         = insightstore.NewStore(fs, cfg.InsightCollector.Deployment.ChunkMaxCount, rd, input.Logger)
 		insightProvider      = insight.NewProvider(insightStore)
 		cmdOutputStore       = commandoutputstore.NewStore(fs, input.Logger)
@@ -210,12 +209,12 @@ func (s *server) run(ctx context.Context, input cli.Input) error {
 			verifier = pipedverifier.NewVerifier(
 				ctx,
 				cfg,
-				// These stores are used to handle PipedAPI request, thus the writer should be PipedWriter.
-				datastore.NewProjectStore(ds, datastore.PipedCommander),
-				datastore.NewPipedStore(ds, datastore.PipedCommander),
+				// These stores are used to handle PipedAPI request.
+				datastore.NewProjectStore(ds),
+				datastore.NewPipedStore(ds),
 				input.Logger,
 			)
-			service = grpcapi.NewPipedAPI(ctx, ds, cache, sls, alss, las, statCache, cmdOutputStore, unregisteredAppStore, cfg.Address, input.Logger)
+			service = grpcapi.NewPipedAPI(ctx, ds, cache, sls, alss, las, statCache, cmdOutputStore, unregisteredAppStore, aso, cfg.Address, input.Logger)
 			opts    = []rpc.Option{
 				rpc.WithPort(s.pipedAPIPort),
 				rpc.WithGracePeriod(s.gracePeriod),
@@ -246,7 +245,7 @@ func (s *server) run(ctx context.Context, input cli.Input) error {
 		var (
 			verifier = apikeyverifier.NewVerifier(
 				ctx,
-				datastore.NewAPIKeyStore(ds, datastore.PipectlCommander),
+				datastore.NewAPIKeyStore(ds),
 				apiKeyLastUsedCache,
 				input.Logger,
 			)
@@ -344,7 +343,7 @@ func (s *server) run(ctx context.Context, input cli.Input) error {
 			cfg.StateKey,
 			cfg.ProjectMap(),
 			cfg.SharedSSOConfigMap(),
-			datastore.NewProjectStore(ds, datastore.WebCommander),
+			datastore.NewProjectStore(ds),
 			!s.insecureCookie,
 			input.Logger,
 		)
@@ -384,9 +383,9 @@ func (s *server) run(ctx context.Context, input cli.Input) error {
 			verifier = pipedverifier.NewVerifier(
 				ctx,
 				cfg,
-				// These stores are used to handle request from piped over envoy ext_authz, thus the writer should be PipedWriter.
-				datastore.NewProjectStore(ds, datastore.PipedCommander),
-				datastore.NewPipedStore(ds, datastore.PipedCommander),
+				// These stores are used to handle request from piped over envoy ext_authz.
+				datastore.NewProjectStore(ds),
+				datastore.NewPipedStore(ds),
 				input.Logger,
 			)
 			service = grpcapi.NewEnvoyAuthorizationServer(verifier)
@@ -462,7 +461,7 @@ func loadConfig(file string) (*config.ControlPlaneSpec, error) {
 	return cfg.ControlPlaneSpec, nil
 }
 
-func createDatastore(ctx context.Context, cfg *config.ControlPlaneSpec, fs filestore.Store, c cache.Cache, logger *zap.Logger) (datastore.DataStore, error) {
+func createDatastore(ctx context.Context, cfg *config.ControlPlaneSpec, logger *zap.Logger) (datastore.DataStore, error) {
 	switch cfg.Datastore.Type {
 	case model.DataStoreFirestore:
 		fsConfig := cfg.Datastore.FirestoreConfig
@@ -484,11 +483,6 @@ func createDatastore(ctx context.Context, cfg *config.ControlPlaneSpec, fs files
 			options = append(options, mysql.WithAuthenticationFile(mqConfig.UsernameFile, mqConfig.PasswordFile))
 		}
 		return mysql.NewMySQL(mqConfig.URL, mqConfig.Database, options...)
-	case model.DataStoreFileDB:
-		options := []filedb.Option{
-			filedb.WithLogger(logger),
-		}
-		return filedb.NewFileDB(fs, c, options...)
 	default:
 		return nil, fmt.Errorf("unknown datastore type %q", cfg.Datastore.Type)
 	}

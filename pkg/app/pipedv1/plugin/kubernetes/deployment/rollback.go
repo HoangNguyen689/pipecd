@@ -18,10 +18,11 @@ import (
 	"cmp"
 	"context"
 
+	sdk "github.com/pipe-cd/piped-plugin-sdk-go"
+
 	kubeconfig "github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/kubernetes/config"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/kubernetes/provider"
 	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/kubernetes/toolregistry"
-	"github.com/pipe-cd/pipecd/pkg/plugin/sdk"
 )
 
 func (p *Plugin) executeK8sRollbackStage(ctx context.Context, input *sdk.ExecuteStageInput[kubeconfig.KubernetesApplicationSpec], dts []*sdk.DeployTarget[kubeconfig.KubernetesDeployTargetConfig]) sdk.StageStatus {
@@ -42,7 +43,7 @@ func (p *Plugin) executeK8sRollbackStage(ctx context.Context, input *sdk.Execute
 
 	lp.Infof("Loading manifests at commit %s for handling", input.Request.RunningDeploymentSource.CommitHash)
 	toolRegistry := toolregistry.NewRegistry(input.Client.ToolRegistry())
-	manifests, err := p.loadManifests(ctx, &input.Request.Deployment, cfg.Spec, &input.Request.RunningDeploymentSource, provider.NewLoader(toolRegistry))
+	manifests, err := p.loadManifests(ctx, &input.Request.Deployment, cfg.Spec, &input.Request.RunningDeploymentSource, provider.NewLoader(toolRegistry), input.Logger)
 	if err != nil {
 		lp.Errorf("Failed while loading manifests (%v)", err)
 		return sdk.StageStatusFailure
@@ -51,13 +52,15 @@ func (p *Plugin) executeK8sRollbackStage(ctx context.Context, input *sdk.Execute
 
 	// Because the loaded manifests are read-only
 	// we duplicate them to avoid updating the shared manifests data in cache.
-	// TODO: implement duplicateManifests function
+	manifests = provider.DeepCopyManifests(manifests)
 
 	// When addVariantLabelToSelector is true, ensure that all workloads
 	// have the variant label in their selector.
 	var (
-		variantLabel   = cfg.Spec.VariantLabel.Key
-		primaryVariant = cfg.Spec.VariantLabel.PrimaryValue
+		variantLabel    = cfg.Spec.VariantLabel.Key
+		primaryVariant  = cfg.Spec.VariantLabel.PrimaryValue
+		baselineVariant = cfg.Spec.VariantLabel.BaselineValue
+		canaryVariant   = cfg.Spec.VariantLabel.CanaryValue
 	)
 	// TODO: Consider other fields to configure whether to add a variant label to the selector
 	// because the rollback stage is executed in both quick sync and pipeline sync strategies.
@@ -71,15 +74,7 @@ func (p *Plugin) executeK8sRollbackStage(ctx context.Context, input *sdk.Execute
 		}
 	}
 
-	// Add variant labels and annotations to all manifests.
-	for i := range manifests {
-		manifests[i].AddLabels(map[string]string{
-			variantLabel: primaryVariant,
-		})
-		manifests[i].AddAnnotations(map[string]string{
-			variantLabel: primaryVariant,
-		})
-	}
+	addVariantLabelsAndAnnotations(manifests, variantLabel, primaryVariant)
 
 	if err := annotateConfigHash(manifests); err != nil {
 		lp.Errorf("Unable to set %q annotation into the workload manifest (%v)", provider.AnnotationConfigHash, err)
@@ -100,8 +95,10 @@ func (p *Plugin) executeK8sRollbackStage(ctx context.Context, input *sdk.Execute
 		return sdk.StageStatusFailure
 	}
 
+	kubectl := provider.NewKubectl(kubectlPath)
+
 	// Create the applier for the target cluster.
-	applier := provider.NewApplier(provider.NewKubectl(kubectlPath), cfg.Spec.Input, deployTargetConfig, input.Logger)
+	applier := provider.NewApplier(kubectl, cfg.Spec.Input, deployTargetConfig, input.Logger)
 
 	// Start applying all manifests to add or update running resources.
 	if err := applyManifests(ctx, applier, manifests, cfg.Spec.Input.Namespace, lp); err != nil {
@@ -109,9 +106,27 @@ func (p *Plugin) executeK8sRollbackStage(ctx context.Context, input *sdk.Execute
 		return sdk.StageStatusFailure
 	}
 
-	// TODO: implement prune resources
-	// TODO: delete all resources of CANARY variant
-	// TODO: delete all resources of BASELINE variant
+	var failed bool
+
+	// TODO: prune resources which doesn't exist in the running manifests but exists in the target manifests.
+	// This occurs when the user adds a new resource and failed the deployment pipeline.
+	// This feature is not implemented in pipedv0, but it's nice to have it in this plugin.
+
+	lp.Info("Start removing CANARY variant resources if exists")
+	if err := deleteVariantResources(ctx, lp, kubectl, deployTargetConfig.KubeConfigPath, applier, input.Request.Deployment.ApplicationID, variantLabel, canaryVariant); err != nil {
+		lp.Errorf("Failed while deleting variant resources (%v)", err)
+		failed = true
+	}
+
+	lp.Info("Start removing BASELINE variant resources if exists")
+	if err := deleteVariantResources(ctx, lp, kubectl, deployTargetConfig.KubeConfigPath, applier, input.Request.Deployment.ApplicationID, variantLabel, baselineVariant); err != nil {
+		lp.Errorf("Failed while deleting variant resources (%v)", err)
+		failed = true
+	}
+
+	if failed {
+		return sdk.StageStatusFailure
+	}
 
 	return sdk.StageStatusSuccess
 }

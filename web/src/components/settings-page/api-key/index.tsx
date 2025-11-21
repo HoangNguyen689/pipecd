@@ -15,29 +15,25 @@ import {
   Toolbar,
   Tooltip,
   Typography,
-} from "@material-ui/core";
-import { Add as AddIcon, MoreVert as MenuIcon } from "@material-ui/icons";
-import Skeleton from "@material-ui/lab/Skeleton";
+} from "@mui/material";
+import { Add as AddIcon, MoreVert as MenuIcon } from "@mui/icons-material";
+import Skeleton from "@mui/material/Skeleton";
 import dayjs from "dayjs";
 import * as React from "react";
-import { FC, memo, useCallback, useEffect, useState } from "react";
+import { FC, memo, useCallback, useState } from "react";
 import { API_KEY_ROLE_TEXT } from "~/constants/api-key-role-text";
 import {
   DISABLE_API_KEY_SUCCESS,
   GENERATE_API_KEY_SUCCESS,
 } from "~/constants/toast-text";
-import { unwrapResult, useAppDispatch, useAppSelector } from "~/hooks/redux";
-import {
-  APIKey,
-  disableAPIKey,
-  fetchAPIKeys,
-  generateAPIKey,
-  selectAll as selectAPIKeys,
-} from "~/modules/api-keys";
-import { addToast } from "~/modules/toasts";
+import { APIKey } from "pipecd/web/model/apikey_pb";
 import { DisableAPIKeyConfirmDialog } from "./components/disable-api-key-confirm-dialog";
 import { GenerateAPIKeyDialog } from "./components/generate-api-key-dialog";
 import { GeneratedAPIKeyDialog } from "./components/generated-api-key-dialog";
+import { useGenerateApiKey } from "~/queries/api-keys/use-generate-api-key";
+import { useDisableApiKey } from "~/queries/api-keys/use-disable-api-key";
+import { useGetApiKeys } from "~/queries/api-keys/use-get-api-keys";
+import { useToast } from "~/contexts/toast-context";
 
 const LoadingSkelton = memo(function LoadingSkelton() {
   return (
@@ -49,7 +45,12 @@ const LoadingSkelton = memo(function LoadingSkelton() {
         <Skeleton width={200} height={30} />
       </TableCell>
       <TableCell align="right">
-        <Box height={48} width={48} />
+        <Box
+          sx={{
+            height: 48,
+            width: 48,
+          }}
+        />
       </TableCell>
     </TableRow>
   );
@@ -62,51 +63,50 @@ const EmptyTableContent = memo(function EmptyTableContent() {
         <Typography>No API Keys</Typography>
       </TableCell>
       <TableCell align="right">
-        <Box height={48} width={48} />
+        <Box
+          sx={{
+            height: 48,
+            width: 48,
+          }}
+        />
       </TableCell>
     </TableRow>
   );
 });
 
-const menuStyle = {
-  style: {
-    width: "25ch",
-  },
-};
-
 export const APIKeyPage: FC = memo(function APIKeyPage() {
-  const dispatch = useAppDispatch();
-  const [loading, keys] = useAppSelector<[boolean, APIKey.AsObject[]]>(
-    (state) => [state.apiKeys.loading, selectAPIKeys(state.apiKeys)]
-  );
   const [isOpenAddForm, setIsOpenAddForm] = useState(false);
-  const [disableTargetId, setDisableTargetId] = useState<null | string>(null);
+  const [disableApiKey, setDisableApiKey] = useState<APIKey.AsObject | null>(
+    null
+  );
   const [anchorEl, setAnchorEl] = React.useState<HTMLButtonElement | null>(
     null
   );
+  const [generatedKey, setGeneratedKey] = useState<string | null>(null);
 
-  useEffect(() => {
-    dispatch(fetchAPIKeys({ enabled: true }));
-  }, [dispatch]);
+  const { data: keys = [], isLoading: loading } = useGetApiKeys({
+    enabled: true,
+  });
+  const { addToast } = useToast();
+
+  const { mutateAsync: generateApiKey } = useGenerateApiKey();
+  const { mutateAsync: disableAPIKey } = useDisableApiKey();
 
   const unixTimeToString = (unixTime: number): string => {
     const dateTime = new Date(unixTime * 1000);
     return dateTime.toString();
   };
 
-  const handleSubmit = useCallback(
+  const handleGenerateKey = useCallback(
     (values: { name: string; role: APIKey.Role }) => {
-      dispatch(generateAPIKey(values))
-        .then(unwrapResult)
-        .then(() => {
-          dispatch(fetchAPIKeys({ enabled: true }));
-          dispatch(
-            addToast({ message: GENERATE_API_KEY_SUCCESS, severity: "success" })
-          );
+      generateApiKey(values)
+        .then((result) => {
+          setGeneratedKey(result.key);
+          addToast({ message: GENERATE_API_KEY_SUCCESS, severity: "success" });
         })
         .catch(() => undefined);
     },
-    [dispatch]
+    [addToast, generateApiKey]
   );
 
   const handleOpenMenu = useCallback(
@@ -121,18 +121,17 @@ export const APIKeyPage: FC = memo(function APIKeyPage() {
   }, [setAnchorEl]);
 
   const handleCancelDisabling = useCallback(() => {
-    setDisableTargetId(null);
-  }, [setDisableTargetId]);
+    setDisableApiKey(null);
+  }, [setDisableApiKey]);
 
   const handleDisable = useCallback(
     (id: string) => {
-      dispatch(disableAPIKey({ id })).then(() => {
-        dispatch(fetchAPIKeys({ enabled: true }));
-        dispatch(addToast({ message: DISABLE_API_KEY_SUCCESS }));
+      disableAPIKey({ id }).then(() => {
+        addToast({ message: DISABLE_API_KEY_SUCCESS });
       });
-      setDisableTargetId(null);
+      setDisableApiKey(null);
     },
-    [dispatch, setDisableTargetId]
+    [addToast, disableAPIKey]
   );
 
   return (
@@ -147,7 +146,6 @@ export const APIKeyPage: FC = memo(function APIKeyPage() {
         </Button>
       </Toolbar>
       <Divider />
-
       <TableContainer component={Paper} square>
         <Table size="small" stickyHeader>
           <TableHead>
@@ -190,7 +188,11 @@ export const APIKeyPage: FC = memo(function APIKeyPage() {
                     )}
                   </TableCell>
                   <TableCell align="right">
-                    <IconButton data-id={key.id} onClick={handleOpenMenu}>
+                    <IconButton
+                      data-id={key.id}
+                      onClick={handleOpenMenu}
+                      size="large"
+                    >
                       <MenuIcon />
                     </IconButton>
                   </TableCell>
@@ -200,18 +202,26 @@ export const APIKeyPage: FC = memo(function APIKeyPage() {
           </TableBody>
         </Table>
       </TableContainer>
-
       <Menu
         id="api-key-menu"
         open={Boolean(anchorEl)}
         anchorEl={anchorEl}
         onClose={handleCloseMenu}
-        PaperProps={menuStyle}
+        slotProps={{
+          paper: {
+            style: {
+              width: "25ch",
+            },
+          },
+        }}
       >
         <MenuItem
           onClick={() => {
             if (anchorEl && anchorEl.dataset.id) {
-              setDisableTargetId(anchorEl.dataset.id);
+              const apiKey = keys.find((key) => key.id === anchorEl.dataset.id);
+              if (apiKey) {
+                setDisableApiKey(apiKey);
+              }
             }
             setAnchorEl(null);
           }}
@@ -219,17 +229,17 @@ export const APIKeyPage: FC = memo(function APIKeyPage() {
           Disable API Key
         </MenuItem>
       </Menu>
-
       <GenerateAPIKeyDialog
         open={isOpenAddForm}
         onClose={() => setIsOpenAddForm(false)}
-        onSubmit={handleSubmit}
+        onSubmit={handleGenerateKey}
       />
-
-      <GeneratedAPIKeyDialog />
-
+      <GeneratedAPIKeyDialog
+        generatedKey={generatedKey}
+        onClose={() => setGeneratedKey(null)}
+      />
       <DisableAPIKeyConfirmDialog
-        apiKeyId={disableTargetId}
+        apiKey={disableApiKey}
         onCancel={handleCancelDisabling}
         onDisable={handleDisable}
       />

@@ -6,40 +6,19 @@ import {
   DialogContent,
   DialogTitle,
   FormControlLabel,
-  makeStyles,
   TextField,
   Typography,
-} from "@material-ui/core";
+} from "@mui/material";
 import { useFormik } from "formik";
-import { FC, memo, useCallback } from "react";
+import { FC, memo, useCallback, useState } from "react";
 import * as yup from "yup";
 import { TextWithCopyButton } from "~/components/text-with-copy-button";
 import { UI_TEXT_CANCEL, UI_TEXT_CLOSE } from "~/constants/ui-text";
-import { useAppDispatch, useAppSelector } from "~/hooks/redux";
-import { Application, selectById } from "~/modules/applications";
-import {
-  clearSealedSecret,
-  generateSealedSecret,
-} from "~/modules/sealed-secret";
-
-const useStyles = makeStyles((theme) => ({
-  targetApp: {
-    color: theme.palette.text.primary,
-    fontWeight: theme.typography.fontWeightMedium,
-  },
-  secretInput: {
-    border: "none",
-    fontSize: 14,
-    flex: 1,
-    textOverflow: "ellipsis",
-  },
-  encryptedSecret: {
-    wordBreak: "break-all",
-  },
-}));
+import { Application } from "~/types/applications";
+import { useGenerateSealedSecret } from "~/queries/sealed-secret/use-generate-sealed-secret";
 
 export interface SealedSecretDialogProps {
-  applicationId: string | null;
+  application?: Application.AsObject | null;
   open: boolean;
   onClose: () => void;
 }
@@ -54,19 +33,10 @@ const validationSchema = yup.object({
 });
 
 export const SealedSecretDialog: FC<SealedSecretDialogProps> = memo(
-  function SealedSecretDialog({ open, applicationId, onClose }) {
-    const classes = useStyles();
-    const dispatch = useAppDispatch();
+  function SealedSecretDialog({ open, application, onClose }) {
+    const [sealedSecret, setSealedSecret] = useState<string | null>(null);
 
-    const application = useAppSelector<Application.AsObject | undefined>(
-      (state) =>
-        applicationId
-          ? selectById(state.applications, applicationId)
-          : undefined
-    );
-    const sealedSecret = useAppSelector<string | null>(
-      (state) => state.sealedSecret.data
-    );
+    const { mutateAsync: generateSealedSecret } = useGenerateSealedSecret();
 
     const formik = useFormik({
       initialValues: {
@@ -78,12 +48,17 @@ export const SealedSecretDialog: FC<SealedSecretDialogProps> = memo(
         if (!application) {
           return;
         }
-        await dispatch(
-          generateSealedSecret({
+        return generateSealedSecret(
+          {
             data: values.secretData,
             pipedId: application.pipedId,
             base64Encoding: values.base64,
-          })
+          },
+          {
+            onSuccess: (data) => {
+              setSealedSecret(data);
+            },
+          }
         );
       },
     });
@@ -94,8 +69,7 @@ export const SealedSecretDialog: FC<SealedSecretDialogProps> = memo(
 
     const handleClose = useCallback(() => {
       onClose();
-      dispatch(clearSealedSecret());
-    }, [dispatch, onClose]);
+    }, [onClose]);
 
     if (!application) {
       return null;
@@ -132,7 +106,13 @@ export const SealedSecretDialog: FC<SealedSecretDialogProps> = memo(
               <Typography variant="caption" color="textSecondary">
                 Application
               </Typography>
-              <Typography variant="body1" className={classes.targetApp}>
+              <Typography
+                variant="body1"
+                sx={(theme) => ({
+                  color: theme.palette.text.primary,
+                  fontWeight: theme.typography.fontWeightMedium,
+                })}
+              >
                 {application.name}
               </Typography>
               <TextField

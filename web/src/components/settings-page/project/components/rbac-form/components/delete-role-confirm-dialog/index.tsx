@@ -4,24 +4,13 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
-  makeStyles,
   Typography,
-} from "@material-ui/core";
-import Alert from "@material-ui/lab/Alert";
+} from "@mui/material";
+import Alert from "@mui/material/Alert";
 import { FC, memo } from "react";
 
-const useStyles = makeStyles((theme) => ({
-  deleteTargetName: {
-    color: theme.palette.text.primary,
-    fontWeight: theme.typography.fontWeightMedium,
-  },
-  description: {
-    marginBottom: theme.spacing(2),
-  },
-}));
-
 export interface DeleteRoleConfirmDialogProps {
-  role: string | null;
+  roleName: string | null;
   onClose: () => void;
   onDelete: (role: string) => void;
 }
@@ -30,19 +19,23 @@ const DIALOG_TITLE = "Delete Role";
 const DESCRIPTION = "Are you sure you want to delete the Role?";
 
 export const DeleteRoleConfirmDialog: FC<DeleteRoleConfirmDialogProps> = memo(
-  function DeleteRoleConfirmDialog({ role, onDelete, onClose }) {
-    const classes = useStyles();
-
+  function DeleteRoleConfirmDialog({ roleName, onDelete, onClose }) {
     return (
-      <Dialog open={Boolean(role)} onClose={onClose}>
+      <Dialog open={Boolean(roleName)} onClose={onClose}>
         <DialogTitle>{DIALOG_TITLE}</DialogTitle>
         <DialogContent>
-          <Alert severity="warning" className={classes.description}>
+          <Alert severity="warning" sx={{ marginBottom: 2 }}>
             {DESCRIPTION}
           </Alert>
           <Typography variant="caption">Role</Typography>
-          <Typography variant="body1" className={classes.deleteTargetName}>
-            {role}
+          <Typography
+            variant="body1"
+            sx={(theme) => ({
+              color: theme.palette.text.primary,
+              fontWeight: theme.typography.fontWeightMedium,
+            })}
+          >
+            {roleName}
           </Typography>
         </DialogContent>
         <DialogActions>
@@ -50,8 +43,8 @@ export const DeleteRoleConfirmDialog: FC<DeleteRoleConfirmDialogProps> = memo(
           <Button
             color="primary"
             onClick={() => {
-              if (role) {
-                onDelete(role);
+              if (roleName) {
+                onDelete(roleName);
               }
             }}
           >

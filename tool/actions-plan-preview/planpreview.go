@@ -19,7 +19,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/shurcooL/githubv4"
 	"log"
 	"os"
 	"os/exec"
@@ -27,6 +26,10 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/shurcooL/githubv4"
+
+	"github.com/pipe-cd/pipecd/pkg/model"
 )
 
 type PlanPreviewResult struct {
@@ -46,9 +49,13 @@ func (r *PlanPreviewResult) NoChange() bool {
 type ApplicationResult struct {
 	ApplicationInfo
 	SyncStrategy string // QUICK_SYNC, PIPELINE
-	PlanSummary  string
-	PlanDetails  string
-	NoChange     bool
+	// Deprecated: Use PluginPlanResults in pipedv1
+	PlanSummary string
+	// Deprecated: Use PluginPlanResults in pipedv1
+	PlanDetails string
+	NoChange    bool
+
+	PluginPlanResults []*model.PluginPlanPreviewResult
 }
 
 type FailurePiped struct {
@@ -58,8 +65,11 @@ type FailurePiped struct {
 
 type FailureApplication struct {
 	ApplicationInfo
-	Reason      string
+	Reason string
+	// Deprecated: Use PluginPlanResults in pipedv1
 	PlanDetails string
+
+	PluginPlanResults []*model.PluginPlanPreviewResult
 }
 
 type PipedInfo struct {
@@ -68,12 +78,16 @@ type PipedInfo struct {
 }
 
 type ApplicationInfo struct {
-	ApplicationID        string
-	ApplicationName      string
-	ApplicationURL       string
-	Env                  string
+	ApplicationID   string
+	ApplicationName string
+	ApplicationURL  string
+	Env             string
+	// Deprecated: Use PluginNames in pipedv1
 	ApplicationKind      string // KUBERNETES, TERRAFORM, CLOUDRUN, LAMBDA, ECS
 	ApplicationDirectory string
+
+	PlannedPluginNames string
+	AllPluginNames     string
 }
 
 func retrievePlanPreview(
@@ -128,18 +142,18 @@ func retrievePlanPreview(
 }
 
 const (
-	successBadgeURL = `<!-- pipecd-plan-preview-->
-[![PLAN_PREVIEW](https://img.shields.io/static/v1?label=PipeCD&message=Plan_Preview&color=success&style=flat)](https://pipecd.dev/docs/user-guide/plan-preview/)`
-	failureBadgeURL = `<!-- pipecd-plan-preview-->
-[![PLAN_PREVIEW](https://img.shields.io/static/v1?label=PipeCD&message=Plan_Preview&color=orange&style=flat)](https://pipecd.dev/docs/user-guide/plan-preview/)`
+	successBadgeURL      = `[![PLAN_PREVIEW](https://img.shields.io/static/v1?label=PipeCD&message=Plan_Preview&color=success&style=flat)](https://pipecd.dev/docs/user-guide/plan-preview/)`
+	failureBadgeURL      = `[![PLAN_PREVIEW](https://img.shields.io/static/v1?label=PipeCD&message=Plan_Preview&color=orange&style=flat)](https://pipecd.dev/docs/user-guide/plan-preview/)`
 	actionBadgeURLFormat = "[![ACTIONS](https://img.shields.io/static/v1?label=PipeCD&message=Action_Log&style=flat)](%s)"
 
-	noChangeTitleFormat     = "Ran plan-preview against head commit %s of this pull request. PipeCD detected `0` updated application. It means no deployment will be triggered once this pull request got merged.\n"
-	hasChangeTitleFormat    = "Ran plan-preview against head commit %s of this pull request. PipeCD detected `%d` updated applications and here are their plan results. Once this pull request got merged their deployments will be triggered to run as these estimations.\n"
-	detailsFormat           = "<details>\n<summary>Details (Click me)</summary>\n<p>\n\n``` %s\n%s\n```\n</p>\n</details>\n\n"
-	detailsOmittedMessage   = "The details are too long to display. Please check the actions log to see full details."
-	appInfoWithEnvFormat    = "app: [%s](%s), env: %s, kind: %s"
-	appInfoWithoutEnvFormat = "app: [%s](%s), kind: %s"
+	noChangeTitleFormat       = "Ran plan-preview against head commit %s of this pull request. PipeCD detected `0` updated application. It means no deployment will be triggered once this pull request got merged.\n"
+	hasChangeTitleFormat      = "Ran plan-preview against head commit %s of this pull request. PipeCD detected `%d` updated applications and here are their plan results. Once this pull request got merged their deployments will be triggered to run as these estimations.\n"
+	detailsFormat             = "<details>\n<summary>Details (Click me)</summary>\n<p>\n\n``` %s\n%s\n```\n</p>\n</details>\n\n"
+	detailsOmittedMessage     = "The details are too long to display. Please check the actions log to see full details."
+	appInfoWithEnvFormat      = "app: [%s](%s), env: %s, kind: %s"
+	appInfoWithoutEnvFormat   = "app: [%s](%s), kind: %s"
+	appInfoWithEnvFormatV1    = "app: [%s](%s), env: %s, planned plugin(s): %s"
+	appInfoWithoutEnvFormatV1 = "app: [%s](%s), planned plugin(s): %s"
 
 	ghMessageLenLimit = 65536
 
@@ -156,8 +170,10 @@ const (
 	prefixTerraformChangesToOutput = "Changes to Outputs:"
 )
 
-func makeCommentBody(event *githubEvent, r *PlanPreviewResult) string {
+func makeCommentBody(event *githubEvent, r *PlanPreviewResult, title string) string {
 	var b strings.Builder
+
+	fmt.Fprintf(&b, "%s\n", makeFilterComment(title))
 
 	if !r.HasError() {
 		b.WriteString(successBadgeURL)
@@ -170,6 +186,10 @@ func makeCommentBody(event *githubEvent, r *PlanPreviewResult) string {
 		fmt.Fprintf(&b, actionBadgeURLFormat, actionLogURL)
 	}
 	b.WriteString("\n\n")
+
+	if title != "" {
+		b.WriteString(fmt.Sprintf("# %s\n\n", title))
+	}
 
 	if event.IsComment {
 		b.WriteString(fmt.Sprintf("@%s ", event.SenderLogin))
@@ -191,30 +211,67 @@ func makeCommentBody(event *githubEvent, r *PlanPreviewResult) string {
 	for _, app := range changedApps {
 		fmt.Fprintf(&b, "### %s\n", makeTitleText(&app.ApplicationInfo))
 		fmt.Fprintf(&b, "Sync strategy: %s\n", app.SyncStrategy)
-		fmt.Fprintf(&b, "Summary: %s\n\n", app.PlanSummary)
 
-		var (
-			lang    = "diff"
-			details = app.PlanDetails
-		)
-		if app.ApplicationKind == "TERRAFORM" {
-			lang = "hcl"
-			if shortened, err := generateTerraformShortPlanDetails(details); err == nil {
-				details = shortened
+		if app.AllPluginNames == "" {
+			// pipedv0
+			fmt.Fprintf(&b, "Summary: %s\n\n", app.PlanSummary)
+			var (
+				lang    = "diff"
+				details = app.PlanDetails
+			)
+			if app.ApplicationKind == "TERRAFORM" {
+				lang = "hcl"
+				if shortened, err := generateTerraformShortPlanDetails(details); err == nil {
+					details = shortened
+				}
+			}
+
+			l := utf8.RuneCountInString(details)
+			if detailLen+l > detailsLenLimit {
+				fmt.Fprintf(&b, detailsFormat, lang, detailsOmittedMessage)
+				detailLen += utf8.RuneCountInString(detailsOmittedMessage)
+				continue
+			}
+
+			if l > 0 {
+				detailLen += l
+				fmt.Fprintf(&b, detailsFormat, lang, details)
+			}
+		} else {
+			// pipedv1
+			fmt.Fprintf(&b, "  Plugin(s): %s\n", app.AllPluginNames)
+			fmt.Fprintf(&b, "  Summary:\n")
+			for _, ppr := range app.PluginPlanResults {
+				fmt.Fprintf(&b, "  - %s(%s): %s\n", ppr.PluginName, ppr.DeployTarget, ppr.PlanSummary)
+			}
+			fmt.Fprint(&b, "\n  Details:\n")
+			for _, ppr := range app.PluginPlanResults {
+				fmt.Fprintf(&b, "  - %s(%s):\n", ppr.PluginName, ppr.DeployTarget)
+
+				details := string(ppr.PlanDetails)
+				switch ppr.DiffLanguage {
+				case "":
+					ppr.DiffLanguage = "diff" // Use diff by default
+				case "hcl":
+					if shortened, err := generateTerraformShortPlanDetails(details); err == nil {
+						details = shortened
+					}
+				}
+
+				l := utf8.RuneCountInString(details)
+				if detailLen+l > detailsLenLimit {
+					fmt.Fprintf(&b, detailsFormat, ppr.DiffLanguage, detailsOmittedMessage)
+					detailLen += utf8.RuneCountInString(detailsOmittedMessage)
+					continue
+				}
+
+				if l > 0 {
+					detailLen += l
+					fmt.Fprintf(&b, detailsFormat, ppr.DiffLanguage, details)
+				}
 			}
 		}
 
-		l := utf8.RuneCountInString(details)
-		if detailLen+l > detailsLenLimit {
-			fmt.Fprintf(&b, detailsFormat, lang, detailsOmittedMessage)
-			detailLen += utf8.RuneCountInString(detailsOmittedMessage)
-			continue
-		}
-
-		if l > 0 {
-			detailLen += l
-			fmt.Fprintf(&b, detailsFormat, lang, details)
-		}
 	}
 
 	if len(pipelineApps)+len(quickSyncApps) > 0 {
@@ -248,13 +305,24 @@ func makeCommentBody(event *githubEvent, r *PlanPreviewResult) string {
 			fmt.Fprintf(&b, "\n### %s\n", makeTitleText(&app.ApplicationInfo))
 			fmt.Fprintf(&b, "Reason: %s\n\n", app.Reason)
 
-			var lang = "diff"
-			if app.ApplicationKind == "TERRAFORM" {
-				lang = "hcl"
-			}
+			if app.AllPluginNames == "" {
+				// pipedv0
+				var lang = "diff"
+				if app.ApplicationKind == "TERRAFORM" {
+					lang = "hcl"
+				}
 
-			if len(app.PlanDetails) > 0 {
-				fmt.Fprintf(&b, detailsFormat, lang, app.PlanDetails)
+				if len(app.PlanDetails) > 0 {
+					fmt.Fprintf(&b, detailsFormat, lang, app.PlanDetails)
+				}
+			} else {
+				// pipedv1
+				for _, ppr := range app.PluginPlanResults {
+					fmt.Fprintf(&b, "  - %s(%s):\n", ppr.PluginName, ppr.DeployTarget)
+					if len(ppr.PlanDetails) > 0 {
+						fmt.Fprintf(&b, detailsFormat, ppr.DiffLanguage, ppr.PlanDetails)
+					}
+				}
 			}
 		}
 	}
@@ -306,10 +374,19 @@ func makeActionLogURL() string {
 }
 
 func makeTitleText(app *ApplicationInfo) string {
-	if app.Env == "" {
-		return fmt.Sprintf(appInfoWithoutEnvFormat, app.ApplicationName, app.ApplicationURL, strings.ToLower(app.ApplicationKind))
+	if app.AllPluginNames == "" {
+		// pipedv0
+		if app.Env == "" {
+			return fmt.Sprintf(appInfoWithoutEnvFormat, app.ApplicationName, app.ApplicationURL, strings.ToLower(app.ApplicationKind))
+		}
+		return fmt.Sprintf(appInfoWithEnvFormat, app.ApplicationName, app.ApplicationURL, app.Env, strings.ToLower(app.ApplicationKind))
+	} else {
+		// pipedv1
+		if app.Env == "" {
+			return fmt.Sprintf(appInfoWithoutEnvFormatV1, app.ApplicationName, app.ApplicationURL, app.PlannedPluginNames)
+		}
+		return fmt.Sprintf(appInfoWithEnvFormatV1, app.ApplicationName, app.ApplicationURL, app.Env, app.PlannedPluginNames)
 	}
-	return fmt.Sprintf(appInfoWithEnvFormat, app.ApplicationName, app.ApplicationURL, app.Env, strings.ToLower(app.ApplicationKind))
 }
 
 func generateTerraformShortPlanDetails(details string) (string, error) {
@@ -335,9 +412,9 @@ func generateTerraformShortPlanDetails(details string) (string, error) {
 	return details[start:], nil
 }
 
-func minimizePreviousComment(ctx context.Context, ghGraphQLClient *githubv4.Client, event *githubEvent) {
+func minimizePreviousComment(ctx context.Context, ghGraphQLClient *githubv4.Client, event *githubEvent, key string) {
 	// Find comments we sent before
-	comment, err := findLatestPlanPreviewComment(ctx, ghGraphQLClient, event.Owner, event.Repo, event.PRNumber)
+	comment, err := findLatestPlanPreviewComment(ctx, ghGraphQLClient, event.Owner, event.Repo, event.PRNumber, key)
 	if err != nil {
 		log.Printf("Unable to find the previous comment to minimize (%v)\n", err)
 	}

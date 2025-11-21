@@ -333,10 +333,10 @@ func extractReleaseNote(def, body string, useReleaseNoteBlock bool) string {
 
 func determineCommitCategory(commit Commit, mergeCommit *Commit, categories []ReleaseCommitCategoryConfig) string {
 	for _, c := range categories {
-		if c.ReleaseCommitMatcherConfig.Empty() {
+		if c.Empty() {
 			return c.ID
 		}
-		if c.ReleaseCommitMatcherConfig.Match(commit, mergeCommit) {
+		if c.Match(commit, mergeCommit) {
 			return c.ID
 		}
 	}
@@ -358,7 +358,7 @@ func renderReleaseNote(p ReleaseProposal, cfg ReleaseConfig) []byte {
 					ns[n] = struct{}{}
 				}
 				for k := range ns {
-					link := fmt.Sprintf("[%s](https://github.com/%s/%s/pull/%s)", k, p.Owner, p.Repo, string(k[1:]))
+					link := fmt.Sprintf("[%s](https://github.com/%s/%s/pull/%s)", k, p.Owner, p.Repo, k[1:])
 					c.ReleaseNote = strings.ReplaceAll(c.ReleaseNote, k, link)
 				}
 			}
@@ -426,7 +426,7 @@ func renderReleaseNote(p ReleaseProposal, cfg ReleaseConfig) []byte {
 	}
 
 	for _, ctg := range cfg.CommitCategories {
-		commits := make([]ReleaseCommit, 0, 0)
+		commits := make([]ReleaseCommit, 0, len(filteredCommits))
 		for _, c := range filteredCommits {
 			if c.CategoryName == ctg.ID {
 				commits = append(commits, c)

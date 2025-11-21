@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pipe-cd/piped-plugin-sdk-go/logpersister/logpersistertest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
@@ -27,20 +28,11 @@ import (
 	"github.com/pipe-cd/pipecd/pkg/model"
 	"github.com/pipe-cd/pipecd/pkg/plugin/api/v1alpha1/common"
 	"github.com/pipe-cd/pipecd/pkg/plugin/api/v1alpha1/deployment"
-	"github.com/pipe-cd/pipecd/pkg/plugin/logpersister/logpersistertest"
 )
 
 type mockStagePlugin struct {
 	result StageStatus
 	err    error
-}
-
-func (m *mockStagePlugin) Name() string {
-	return "mockStagePlugin"
-}
-
-func (m *mockStagePlugin) Version() string {
-	return "v1.0.0"
 }
 
 func (m *mockStagePlugin) FetchDefinedStages() []string {
@@ -76,7 +68,7 @@ func (m *mockStagePlugin) ExecuteStage(ctx context.Context, config *struct{}, ta
 func newTestStagePluginServiceServer(t *testing.T, plugin *mockStagePlugin) *StagePluginServiceServer[struct{}, struct{}, struct{}] {
 	return &StagePluginServiceServer[struct{}, struct{}, struct{}]{
 		base: plugin,
-		commonFields: commonFields{
+		commonFields: commonFields[struct{}, struct{}]{
 			logger:       zaptest.NewLogger(t),
 			logPersister: logpersistertest.NewTestLogPersister(t),
 		},
@@ -308,13 +300,9 @@ func TestStagePluginServiceServer_BuildQuickSyncStages(t *testing.T) {
 
 	request := &deployment.BuildQuickSyncStagesRequest{}
 	response, err := server.BuildQuickSyncStages(context.Background(), request)
-	if err == nil {
-		t.Fatalf("expected error, got nil")
-	}
-
-	if response != nil {
-		t.Errorf("expected nil response, got %v", response)
-	}
+	require.NoError(t, err)
+	assert.NotNil(t, response)
+	assert.Empty(t, response.GetStages())
 }
 
 func TestStageStatus_toModelEnum(t *testing.T) {
@@ -337,6 +325,11 @@ func TestStageStatus_toModelEnum(t *testing.T) {
 			name:     "exited",
 			status:   StageStatusExited,
 			expected: model.StageStatus_STAGE_EXITED,
+		},
+		{
+			name:     "skipped",
+			status:   StageStatusSkipped,
+			expected: model.StageStatus_STAGE_SKIPPED,
 		},
 		{
 			name:     "unknown",
@@ -450,7 +443,7 @@ spec: {}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := newDetermineVersionsRequest[struct{}](tt.request)
+			result, err := newDetermineVersionsRequest[struct{}]("test-plugin", tt.request)
 			require.NoError(t, err)
 			assert.Equal(t, tt.expected.Deployment, result.Deployment)
 			assert.Equal(t, tt.expected.DeploymentSource.ApplicationDirectory, result.DeploymentSource.ApplicationDirectory)
@@ -461,6 +454,9 @@ spec: {}
 }
 
 func TestArtifactVersion_toModel(t *testing.T) {
+	// Use the default value for expected "Kind" for now.
+	// They will be removed after deleting Kind from model.ArtifactVersion.
+
 	tests := []struct {
 		name     string
 		version  ArtifactVersion
@@ -469,13 +465,12 @@ func TestArtifactVersion_toModel(t *testing.T) {
 		{
 			name: "container image",
 			version: ArtifactVersion{
-				Kind:    ArtifactKindContainerImage,
 				Version: "v1.0.0",
 				Name:    "nginx",
 				URL:     "https://example.com/nginx:v1.0.0",
 			},
 			expected: &model.ArtifactVersion{
-				Kind:    model.ArtifactVersion_CONTAINER_IMAGE,
+				Kind:    model.ArtifactVersion_UNKNOWN,
 				Version: "v1.0.0",
 				Name:    "nginx",
 				Url:     "https://example.com/nginx:v1.0.0",
@@ -484,13 +479,12 @@ func TestArtifactVersion_toModel(t *testing.T) {
 		{
 			name: "s3 object",
 			version: ArtifactVersion{
-				Kind:    ArtifactKindS3Object,
 				Version: "v1.0.0",
 				Name:    "backup",
 				URL:     "s3://bucket/backup/v1.0.0",
 			},
 			expected: &model.ArtifactVersion{
-				Kind:    model.ArtifactVersion_S3_OBJECT,
+				Kind:    model.ArtifactVersion_UNKNOWN,
 				Version: "v1.0.0",
 				Name:    "backup",
 				Url:     "s3://bucket/backup/v1.0.0",
@@ -499,13 +493,12 @@ func TestArtifactVersion_toModel(t *testing.T) {
 		{
 			name: "git source",
 			version: ArtifactVersion{
-				Kind:    ArtifactKindGitSource,
 				Version: "commit-hash",
 				Name:    "repo",
 				URL:     "https://github.com/repo/commit/commit-hash",
 			},
 			expected: &model.ArtifactVersion{
-				Kind:    model.ArtifactVersion_GIT_SOURCE,
+				Kind:    model.ArtifactVersion_UNKNOWN,
 				Version: "commit-hash",
 				Name:    "repo",
 				Url:     "https://github.com/repo/commit/commit-hash",
@@ -514,13 +507,12 @@ func TestArtifactVersion_toModel(t *testing.T) {
 		{
 			name: "terraform module",
 			version: ArtifactVersion{
-				Kind:    ArtifactKindTerraformModule,
 				Version: "v1.0.0",
 				Name:    "module",
 				URL:     "https://registry.terraform.io/modules/module/v1.0.0",
 			},
 			expected: &model.ArtifactVersion{
-				Kind:    model.ArtifactVersion_TERRAFORM_MODULE,
+				Kind:    model.ArtifactVersion_UNKNOWN,
 				Version: "v1.0.0",
 				Name:    "module",
 				Url:     "https://registry.terraform.io/modules/module/v1.0.0",
@@ -529,7 +521,6 @@ func TestArtifactVersion_toModel(t *testing.T) {
 		{
 			name: "unknown kind",
 			version: ArtifactVersion{
-				Kind:    ArtifactKindUnknown,
 				Version: "v1.0.0",
 				Name:    "unknown",
 				URL:     "https://example.com/unknown:v1.0.0",
@@ -551,50 +542,10 @@ func TestArtifactVersion_toModel(t *testing.T) {
 	}
 }
 
-func TestArtifactKind_toModelEnum(t *testing.T) {
-	tests := []struct {
-		name     string
-		kind     ArtifactKind
-		expected model.ArtifactVersion_Kind
-	}{
-		{
-			name:     "container image",
-			kind:     ArtifactKindContainerImage,
-			expected: model.ArtifactVersion_CONTAINER_IMAGE,
-		},
-		{
-			name:     "s3 object",
-			kind:     ArtifactKindS3Object,
-			expected: model.ArtifactVersion_S3_OBJECT,
-		},
-		{
-			name:     "git source",
-			kind:     ArtifactKindGitSource,
-			expected: model.ArtifactVersion_GIT_SOURCE,
-		},
-		{
-			name:     "terraform module",
-			kind:     ArtifactKindTerraformModule,
-			expected: model.ArtifactVersion_TERRAFORM_MODULE,
-		},
-		{
-			name:     "unknown",
-			kind:     ArtifactKindUnknown,
-			expected: model.ArtifactVersion_UNKNOWN,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tt.kind.toModelEnum()
-			if result != tt.expected {
-				t.Errorf("expected %v, got %v", tt.expected, result)
-			}
-		})
-	}
-}
-
 func TestDetermineVersionsResponse_toModel(t *testing.T) {
+	// Use the default value for expected "Kind" for now.
+	// They will be removed after deleting Kind from model.ArtifactVersion.
+
 	tests := []struct {
 		name     string
 		response DetermineVersionsResponse
@@ -605,7 +556,6 @@ func TestDetermineVersionsResponse_toModel(t *testing.T) {
 			response: DetermineVersionsResponse{
 				Versions: []ArtifactVersion{
 					{
-						Kind:    ArtifactKindContainerImage,
 						Version: "v1.0.0",
 						Name:    "nginx",
 						URL:     "https://example.com/nginx:v1.0.0",
@@ -614,7 +564,7 @@ func TestDetermineVersionsResponse_toModel(t *testing.T) {
 			},
 			expected: []*model.ArtifactVersion{
 				{
-					Kind:    model.ArtifactVersion_CONTAINER_IMAGE,
+					Kind:    model.ArtifactVersion_UNKNOWN,
 					Version: "v1.0.0",
 					Name:    "nginx",
 					Url:     "https://example.com/nginx:v1.0.0",
@@ -626,13 +576,11 @@ func TestDetermineVersionsResponse_toModel(t *testing.T) {
 			response: DetermineVersionsResponse{
 				Versions: []ArtifactVersion{
 					{
-						Kind:    ArtifactKindContainerImage,
 						Version: "v1.0.0",
 						Name:    "nginx",
 						URL:     "https://example.com/nginx:v1.0.0",
 					},
 					{
-						Kind:    ArtifactKindS3Object,
 						Version: "v1.0.0",
 						Name:    "backup",
 						URL:     "s3://bucket/backup/v1.0.0",
@@ -641,13 +589,13 @@ func TestDetermineVersionsResponse_toModel(t *testing.T) {
 			},
 			expected: []*model.ArtifactVersion{
 				{
-					Kind:    model.ArtifactVersion_CONTAINER_IMAGE,
+					Kind:    model.ArtifactVersion_UNKNOWN,
 					Version: "v1.0.0",
 					Name:    "nginx",
 					Url:     "https://example.com/nginx:v1.0.0",
 				},
 				{
-					Kind:    model.ArtifactVersion_S3_OBJECT,
+					Kind:    model.ArtifactVersion_UNKNOWN,
 					Version: "v1.0.0",
 					Name:    "backup",
 					Url:     "s3://bucket/backup/v1.0.0",
@@ -744,7 +692,7 @@ spec: {}
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			result, _ := newDetermineStrategyRequest[struct{}](tt.request)
+			result, _ := newDetermineStrategyRequest[struct{}]("test-plugin", tt.request)
 			assert.Equal(t, tt.expected.Deployment, result.Deployment)
 		})
 	}

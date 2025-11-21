@@ -1,14 +1,15 @@
-import { ThemeProvider } from "@material-ui/core";
-import CssBaseline from "@material-ui/core/CssBaseline";
+import { ThemeProvider, StyledEngineProvider } from "@mui/material";
+import CssBaseline from "@mui/material/CssBaseline";
 import { render } from "react-dom";
 import { theme } from "./theme";
-import { Provider } from "react-redux";
-import { store } from "./store";
 import { Routes } from "./routes";
 import { BrowserRouter } from "react-router-dom";
 import { setupDayjs } from "./utils/setup-dayjs";
-import { fetchMe } from "./modules/me";
 import { CookiesProvider } from "react-cookie";
+import QueryClientWrap from "./contexts/query-client-provider";
+import { AuthProvider } from "./contexts/auth-context";
+import { ToastProvider } from "./contexts/toast-context/toast-provider";
+import { CommandProvider } from "./contexts/command-context";
 
 async function run(): Promise<void> {
   if (process.env.ENABLE_MOCK === "true") {
@@ -42,11 +43,11 @@ Happy PipeCD-ing 🙌
 
   setupDayjs();
 
-  store.dispatch(fetchMe());
+  // store.dispatch(fetchMe());
 
   render(
     <CookiesProvider>
-      <Provider store={store}>
+      <StyledEngineProvider injectFirst>
         <ThemeProvider theme={theme}>
           <BrowserRouter
             future={{
@@ -54,11 +55,19 @@ Happy PipeCD-ing 🙌
               v7_relativeSplatPath: false,
             }}
           >
-            <CssBaseline />
-            <Routes />
+            <ToastProvider>
+              <QueryClientWrap>
+                <AuthProvider>
+                  <CommandProvider>
+                    <CssBaseline />
+                    <Routes />
+                  </CommandProvider>
+                </AuthProvider>
+              </QueryClientWrap>
+            </ToastProvider>
           </BrowserRouter>
         </ThemeProvider>
-      </Provider>
+      </StyledEngineProvider>
     </CookiesProvider>,
     document.getElementById("root")
   );

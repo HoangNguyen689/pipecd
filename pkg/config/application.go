@@ -58,6 +58,9 @@ type GenericApplicationSpec struct {
 	EventWatcher []EventWatcherConfig `json:"eventWatcher"`
 	// Configuration for drift detection
 	DriftDetection *DriftDetection `json:"driftDetection"`
+
+	// This is a workaround not to raise unknown-field error when the application config file contains the plugins field.
+	Plugins any `json:"plugins"`
 }
 
 type DeploymentPlanner struct {
@@ -476,7 +479,7 @@ func (a *AnalysisStageOptions) Validate() error {
 			}
 			continue
 		}
-		if err := m.AnalysisMetrics.Validate(); err != nil {
+		if err := m.Validate(); err != nil {
 			return fmt.Errorf("one of metrics configurations of ANALYSIS stage is invalid: %w", err)
 		}
 	}
@@ -488,7 +491,7 @@ func (a *AnalysisStageOptions) Validate() error {
 			}
 			continue
 		}
-		if err := l.AnalysisLog.Validate(); err != nil {
+		if err := l.Validate(); err != nil {
 			return fmt.Errorf("one of log configurations of ANALYSIS stage is invalid: %w", err)
 		}
 	}
@@ -499,7 +502,7 @@ func (a *AnalysisStageOptions) Validate() error {
 			}
 			continue
 		}
-		if err := h.AnalysisHTTP.Validate(); err != nil {
+		if err := h.Validate(); err != nil {
 			return fmt.Errorf("one of http configurations of ANALYSIS stage is invalid: %w", err)
 		}
 	}
@@ -755,7 +758,7 @@ type DeploymentChainTriggerCondition struct {
 func (c *DeploymentChainTriggerCondition) Validate() error {
 	hasCond := c.CommitPrefix != ""
 	if !hasCond {
-		return fmt.Errorf("missing commitPrefix configration as deployment chain trigger condition")
+		return fmt.Errorf("missing commitPrefix configuration as deployment chain trigger condition")
 	}
 	return nil
 }

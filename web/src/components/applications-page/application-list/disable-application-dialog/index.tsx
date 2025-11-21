@@ -4,57 +4,35 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
-  makeStyles,
   Typography,
-} from "@material-ui/core";
-import Alert from "@material-ui/lab/Alert";
+} from "@mui/material";
+import Alert from "@mui/material/Alert";
 import { FC, memo } from "react";
-import { useAppSelector, useAppDispatch } from "~/hooks/redux";
-import {
-  Application,
-  disableApplication,
-  selectById,
-} from "~/modules/applications";
-
-const useStyles = makeStyles((theme) => ({
-  disableTargetName: {
-    color: theme.palette.text.primary,
-    fontWeight: theme.typography.fontWeightMedium,
-  },
-  description: {
-    marginBottom: theme.spacing(2),
-  },
-}));
+import { useDisableApplication } from "~/queries/applications/use-disable-application";
+import { Application } from "~/types/applications";
 
 export interface DisableApplicationDialogProps {
   open: boolean;
-  applicationId: string | null;
+  application?: Application.AsObject | null;
   onCancel: () => void;
   onDisable: () => void;
 }
 
 export const DisableApplicationDialog: FC<DisableApplicationDialogProps> = memo(
   function DisableApplicationDialog({
-    applicationId,
+    application,
     open,
     onDisable,
     onCancel,
   }) {
-    const classes = useStyles();
-    const dispatch = useAppDispatch();
-
-    const application = useAppSelector<Application.AsObject | undefined>(
-      (state) =>
-        applicationId
-          ? selectById(state.applications, applicationId)
-          : undefined
-    );
+    const { mutate: disableApplication } = useDisableApplication();
 
     const handleDisable = (): void => {
-      if (applicationId) {
-        dispatch(disableApplication({ applicationId })).then(() => {
-          onDisable();
-        });
+      if (application) {
+        disableApplication(
+          { applicationId: application.id },
+          { onSuccess: () => onDisable() }
+        );
       }
     };
 
@@ -66,11 +44,22 @@ export const DisableApplicationDialog: FC<DisableApplicationDialogProps> = memo(
       <Dialog open={Boolean(application) && open}>
         <DialogTitle>Disable application</DialogTitle>
         <DialogContent>
-          <Alert severity="warning" className={classes.description}>
+          <Alert
+            severity="warning"
+            sx={{
+              marginBottom: 2,
+            }}
+          >
             Are you sure you want to disable the application?
           </Alert>
           <Typography variant="caption">NAME</Typography>
-          <Typography variant="body1" className={classes.disableTargetName}>
+          <Typography
+            variant="body1"
+            sx={(theme) => ({
+              color: theme.palette.text.primary,
+              fontWeight: theme.typography.fontWeightMedium,
+            })}
+          >
             {application.name}
           </Typography>
         </DialogContent>
@@ -82,5 +71,9 @@ export const DisableApplicationDialog: FC<DisableApplicationDialogProps> = memo(
         </DialogActions>
       </Dialog>
     );
-  }
+  },
+  (prev, next) =>
+    prev.open === next.open &&
+    prev.application?.id === next.application?.id &&
+    prev.application?.name === next.application?.name
 );

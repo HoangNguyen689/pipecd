@@ -1,11 +1,4 @@
-import {
-  Box,
-  Card,
-  CardContent,
-  makeStyles,
-  Typography,
-} from "@material-ui/core";
-import clsx from "clsx";
+import { Box, CardContent, Typography } from "@mui/material";
 import { FC, useEffect, useMemo } from "react";
 import {
   GridComponent,
@@ -16,28 +9,15 @@ import {
 import * as echarts from "echarts/core";
 import { BarChart } from "echarts/charts";
 import { CanvasRenderer } from "echarts/renderers";
-import grey from "@material-ui/core/colors/grey";
-import lineColor from "@material-ui/core/colors/purple";
-import { useAppSelector } from "~/hooks/redux";
-import { selectAll as selectAllApplications } from "~/modules/applications";
-import { selectAllPipeds } from "~/modules/pipeds";
 import ChartEmptyData from "~/components/chart-empty-data";
 import useEChartState from "~/hooks/useEChartState";
 
-const useStyles = makeStyles(() => ({
-  root: {
-    minWidth: 300,
-    display: "inline-block",
-    overflow: "visible",
-    position: "relative",
-  },
-  pageTitle: {
-    fontWeight: "bold",
-  },
-}));
+import { grey, purple as lineColor } from "@mui/material/colors";
+import { CardWrapper } from "./styles";
+import { useGetApplications } from "~/queries/applications/use-get-applications";
+import { useGetPipeds } from "~/queries/pipeds/use-get-pipeds";
 
 const ApplicationByPiped: FC = () => {
-  const classes = useStyles();
   const { chart, chartElm } = useEChartState({
     extensions: [
       TitleComponent,
@@ -48,11 +28,10 @@ const ApplicationByPiped: FC = () => {
       LegendComponent,
     ],
   });
-  const applications = useAppSelector((state) =>
-    selectAllApplications(state.applications)
-  );
 
-  const pipedList = useAppSelector(selectAllPipeds);
+  const { data: applications = [] } = useGetApplications();
+
+  const { data: pipedList = [] } = useGetPipeds({ withStatus: true });
 
   const data: { name: string; count: number; rank: number }[] = useMemo(() => {
     const pipedMap = pipedList.reduce((acc, piped) => {
@@ -147,22 +126,26 @@ const ApplicationByPiped: FC = () => {
   }, [chart, data, isNoData, yMax]);
 
   return (
-    <Card raised className={clsx(classes.root)}>
+    <CardWrapper raised>
       <CardContent>
         <Typography
           color="textSecondary"
           gutterBottom
-          className={classes.pageTitle}
+          sx={{ fontWeight: "bold" }}
         >
           Application by piped
         </Typography>
 
-        <Box position={"relative"}>
+        <Box
+          sx={{
+            position: "relative",
+          }}
+        >
           <div style={{ width: "100%", height: 200 }} ref={chartElm} />
           <ChartEmptyData visible={!data.length} />
         </Box>
       </CardContent>
-    </Card>
+    </CardWrapper>
   );
 };
 

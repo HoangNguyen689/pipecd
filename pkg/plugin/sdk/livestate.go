@@ -16,7 +16,6 @@ package sdk
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"go.uber.org/zap"
@@ -42,45 +41,14 @@ type LivestatePlugin[Config, DeployTargetConfig, ApplicationConfigSpec any] inte
 // It is used to register the plugin to the gRPC server.
 type LivestatePluginServer[Config, DeployTargetConfig, ApplicationConfigSpec any] struct {
 	livestate.UnimplementedLivestateServiceServer
-	commonFields
+	commonFields[Config, DeployTargetConfig]
 
-	base          LivestatePlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
-	config        Config
-	deployTargets map[string]*DeployTarget[DeployTargetConfig]
+	base LivestatePlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
 }
 
 // Register registers the plugin to the gRPC server.
 func (s *LivestatePluginServer[Config, DeployTargetConfig, ApplicationConfigSpec]) Register(server *grpc.Server) {
 	livestate.RegisterLivestateServiceServer(server, s)
-}
-
-// setFields sets the common fields and configs to the server.
-func (s *LivestatePluginServer[Config, DeployTargetConfig, ApplicationConfigSpec]) setFields(fields commonFields) error {
-	s.commonFields = fields
-
-	cfg := fields.config
-	if cfg.Config != nil {
-		if err := json.Unmarshal(cfg.Config, &s.config); err != nil {
-			s.logger.Fatal("failed to unmarshal the plugin config", zap.Error(err))
-			return err
-		}
-	}
-
-	s.deployTargets = make(map[string]*DeployTarget[DeployTargetConfig], len(cfg.DeployTargets))
-	for _, dt := range cfg.DeployTargets {
-		var sdkDt DeployTargetConfig
-		if err := json.Unmarshal(dt.Config, &sdkDt); err != nil {
-			s.logger.Fatal("failed to unmarshal deploy target config", zap.Error(err))
-			return err
-		}
-		s.deployTargets[dt.Name] = &DeployTarget[DeployTargetConfig]{
-			Name:   dt.Name,
-			Labels: dt.Labels,
-			Config: sdkDt,
-		}
-	}
-
-	return nil
 }
 
 // GetLivestate returns the live state of the resources in the given application.
@@ -103,12 +71,12 @@ func (s *LivestatePluginServer[Config, DeployTargetConfig, ApplicationConfigSpec
 		toolRegistry:  s.toolRegistry,
 	}
 
-	deploymentSource, err := newDeploymentSource[ApplicationConfigSpec](request.GetDeploySource())
+	deploymentSource, err := newDeploymentSource[ApplicationConfigSpec](s.name, request.GetDeploySource())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to parse deployment source: %v", err)
 	}
 
-	response, err := s.base.GetLivestate(ctx, &s.config, deployTargets, &GetLivestateInput[ApplicationConfigSpec]{
+	response, err := s.base.GetLivestate(ctx, s.pluginConfig, deployTargets, &GetLivestateInput[ApplicationConfigSpec]{
 		Request: GetLivestateRequest[ApplicationConfigSpec]{
 			PipedID:          request.GetPipedId(),
 			ApplicationID:    request.GetApplicationId(),
@@ -122,7 +90,7 @@ func (s *LivestatePluginServer[Config, DeployTargetConfig, ApplicationConfigSpec
 		return nil, status.Errorf(codes.Internal, "failed to get the live state: %v", err)
 	}
 
-	return response.toModel(s.commonFields.config.Name, time.Now()), nil
+	return response.toModel(s.config.Name, time.Now()), nil
 }
 
 // GetLivestateInput is the input for the GetLivestate method.
@@ -165,8 +133,38 @@ func (r *GetLivestateResponse) toModel(pluginName string, now time.Time) *livest
 
 // ApplicationLiveState represents the live state of an application.
 type ApplicationLiveState struct {
-	Resources    []ResourceState
-	HealthStatus ApplicationHealthStatus
+	Resources []ResourceState
+}
+
+// healthStatus returns the health status of the application.
+// It returns ApplicationHealthStateUnknown in the following priority:
+// 1. If there is any unknown health status resource, it returns ApplicationHealthStateUnknown.
+// 2. If there is any unhealthy resource, it returns ApplicationHealthStateOther.
+// 3. Otherwise, it returns ApplicationHealthStateHealthy.
+func (s *ApplicationLiveState) healthStatus() ApplicationHealthStatus {
+	var (
+		unhealthy bool
+		unknown   bool
+	)
+
+	for _, rs := range s.Resources {
+		switch rs.HealthStatus {
+		case ResourceHealthStateUnhealthy:
+			unhealthy = true
+		case ResourceHealthStateUnknown:
+			unknown = true
+		}
+	}
+
+	if unknown {
+		return ApplicationHealthStateUnknown
+	}
+
+	if unhealthy {
+		return ApplicationHealthStateOther
+	}
+
+	return ApplicationHealthStateHealthy
 }
 
 // toModel converts the ApplicationLiveState to the model.ApplicationLiveState.
@@ -177,7 +175,7 @@ func (s *ApplicationLiveState) toModel(pluginName string, now time.Time) *model.
 	}
 	return &model.ApplicationLiveState{
 		Resources:    resources,
-		HealthStatus: s.HealthStatus.toModel(),
+		HealthStatus: s.healthStatus().toModel(),
 	}
 }
 
